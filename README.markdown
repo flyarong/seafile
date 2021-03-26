@@ -71,8 +71,7 @@ Bug and Feature Request Reports
 
 Please only submit bugs in GitHub issues (Pro customers should contact us via Email):
 
-* Server and Web interface (Seahub): https://github.com/haiwen/seafile/issues
-* Desktop client: https://github.com/haiwen/seafile-client/issues
+* Server, Web interface (Seahub) and desktop clients: https://github.com/haiwen/seafile/issues
 * Android client: https://github.com/haiwen/seadroid/issues
 * iOS client: https://github.com/haiwen/seafile-iOS/issues
 
@@ -89,7 +88,7 @@ Internationalization (I18n)
 Change Logs
 ===========
 
-See <https://seacloud.cc/group/3/wiki/home/#Roadmap-ChangeLogs>
+See <https://manual.seafile.com/changelog/server-changelog/>
 
 
 Why Open Source

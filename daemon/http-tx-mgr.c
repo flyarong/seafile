@@ -627,7 +627,7 @@ set_proxy (CURL *curl, gboolean is_https)
     } else if (g_strcmp0(seaf->http_proxy_type, PROXY_TYPE_SOCKS) == 0) {
         if (seaf->http_proxy_port < 0)
             return;
-        curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5);
+        curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5_HOSTNAME);
         curl_easy_setopt(curl, CURLOPT_PROXY, seaf->http_proxy_addr);
         curl_easy_setopt(curl, CURLOPT_PROXYPORT, seaf->http_proxy_port);
     }
@@ -2979,11 +2979,21 @@ out:
 
 #define MAX_OBJECT_PACK_SIZE (1 << 20) /* 1MB */
 
+#ifdef WIN32
+__pragma(pack(push, 1))
+typedef struct {
+    char obj_id[40];
+    guint32 obj_size;
+    guint8 object[0];
+} ObjectHeader;
+__pragma(pack(pop))
+#else
 typedef struct {
     char obj_id[40];
     guint32 obj_size;
     guint8 object[0];
 } __attribute__((__packed__)) ObjectHeader;
+#endif
 
 static int
 send_fs_objects (HttpTxTask *task, Connection *conn, GList **send_fs_list)

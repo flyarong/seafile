@@ -5,9 +5,12 @@
 #ifdef WIN32
 #include <windows.h>
 #include <wincrypt.h>
+#include <shellapi.h>
 #endif
 
+#ifndef WIN32
 #include <unistd.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -22,6 +25,10 @@
 #ifdef HAVE_BREAKPAD_SUPPORT
 #include <c_bpwrapper.h>
 #endif // HAVE_BREAKPAD_SUPPORT
+
+#ifdef ENABLE_BREAKPAD
+#include "c_bpwrapper.h"
+#endif // ENABLE_BREAKPAD
 
 #include <searpc.h>
 #include <searpc-named-pipe-transport.h>
@@ -286,7 +293,7 @@ char *b64encode(const char *input)
 {
     char buf[32767] = {0};
     DWORD retlen = 32767;
-    CryptBinaryToString((BYTE*) input, strlen(input), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, buf, &retlen);
+    CryptBinaryToStringA((BYTE*) input, strlen(input), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, buf, &retlen);
     return strdup(buf);
 }
 #endif
@@ -297,9 +304,9 @@ start_searpc_server ()
     register_rpc_service ();
 
 #ifdef WIN32
-    DWORD bufCharCount = 32767;
-    char userNameBuf[bufCharCount];
-    if (GetUserName(userNameBuf, &bufCharCount) == 0) {
+    char userNameBuf[32767];
+    DWORD bufCharCount = sizeof(userNameBuf);
+    if (GetUserNameA(userNameBuf, &bufCharCount) == 0) {
         seaf_warning ("Failed to get user name, GLE=%lu, required size is %lu\n",
                       GetLastError(), bufCharCount);
         return -1;
@@ -360,7 +367,7 @@ get_argv_utf8 (int *argc)
 int
 main (int argc, char **argv)
 {
-#ifdef HAVE_BREAKPAD_SUPPORT
+#if defined(HAVE_BREAKPAD_SUPPORT) || defined(ENABLE_BREAKPAD)
 #ifdef WIN32
 #define DUMPS_DIR "~/ccnet/logs/dumps/"
 #else
