@@ -2,6 +2,7 @@
 
 Seafile is an open source cloud storage system with privacy protection and teamwork features. Collections of files are called libraries. Each library can be synced separately. A library can also be encrypted with a user chosen password. Seafile also allows users to create groups and easily sharing files into groups.
 
+Beyond sync and share, Seafile provides advanced metadata management features and handy collaboration features.
 
 ## Feature Summary
 
@@ -33,16 +34,18 @@ Seafile has the following features:
 1. Library encryption with a user chosen password.
 2. Client side encryption when using the desktop syncing.
 
-### Online documents and knowledge management (New)
+### Metadata Management
 
-* Online Markdown editing in WYSIWYG way
-* A draft review workflow for online documents
-* Metadata management, including
-  * File labels
-  * Related documents
-* Wiki mode
-* Realtime notifications
+* Extensible file properties, like file owner, deadline, status
+* Flexible file views to match your use cases, including table view, Kanban view, gallery view, map view and statistics view
+* File tags with parent-child hierarchy
 
+### Collaboration
+
+* Integration with Online Office Suites, including OnlyOffice, Collabora
+* SeaDoc: a built-in collaborative document editor
+* Wiki: built-in knowledge bases
+* Integrarion with Excalidraw for collaborative white-board
 
 ## Source repositories for Seafile components
 
@@ -64,15 +67,14 @@ For this reason, the sync client daemon repository is still the "front page" for
 Build and Run
 =============
 
-See <http://manual.seafile.com/build_seafile/server.html>
+See [https://manual.seafile.com/build_seafile/server](https://manual.seafile.com/latest/develop/server/)
 
 Bug and Feature Request Reports
 ===============================
 
 Please only submit bugs in GitHub issues (Pro customers should contact us via Email):
 
-* Server and Web interface (Seahub): https://github.com/haiwen/seafile/issues
-* Desktop client: https://github.com/haiwen/seafile-client/issues
+* Server, Web interface (Seahub) and desktop clients: https://github.com/haiwen/seafile/issues
 * Android client: https://github.com/haiwen/seadroid/issues
 * iOS client: https://github.com/haiwen/seafile-iOS/issues
 
@@ -81,7 +83,7 @@ Feature requests can be made and installation/usage problems can be discussed in
 Internationalization (I18n)
 ===========================
 
-* [Translate Seafile web ui](https://github.com/haiwen/seafile/wiki/Seahub-Translation)
+* [Translate Seafile web ui](https://github.com/haiwen/seahub/?tab=readme-ov-file#internationalization-i18n)
 * [Translate Seafile desktop client](https://github.com/haiwen/seafile-client/#internationalization)
 * [Translate Seafile Android app](https://github.com/haiwen/seadroid#internationalization)
 * [Translate Seafile iOS app](https://github.com/haiwen/seafile-ios#internationalization-i18n)
@@ -89,7 +91,7 @@ Internationalization (I18n)
 Change Logs
 ===========
 
-See <https://seacloud.cc/group/3/wiki/home/#Roadmap-ChangeLogs>
+See https://manual.seafile.com/latest/changelog/server-changelog/
 
 
 Why Open Source
@@ -101,7 +103,7 @@ Our primary goal is to build a first-class product. We think this goal can only 
 Contributing
 ===========
 
-For more information read [Contribution](http://manual.seafile.com/contribution.html).
+For more information read [Contribution](https://manual.seafile.com/latest/introduction/contribution/).
 
 
 License

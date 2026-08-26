@@ -3,8 +3,10 @@
 #include "common.h"
 
 #include <stdint.h>
+#ifndef WIN32
 #include <dirent.h>
 #include <unistd.h>
+#endif
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -234,6 +236,10 @@ seafile_session_new(const char *seafile_dir,
     if (!session->mq_mgr)
         goto onerror;
 
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+    session->notif_mgr = seaf_notif_manager_new (session);
+#endif
+
     return session;
 
 onerror:
@@ -346,6 +352,8 @@ out:
     g_key_file_free (key_file);
 }
 
+#define MAX_DELETED_FILES_NUM 500
+
 void
 seafile_session_prepare (SeafileSession *session)
 {
@@ -413,6 +421,10 @@ seafile_session_prepare (SeafileSession *session)
             seafile_session_config_get_string(session, KEY_PROXY_PASSWORD);
     }
 
+    session->delete_confirm_threshold = seafile_session_config_get_int (session, KEY_DELETE_CONFIRM_THRESHOLD, NULL);
+    if (session->delete_confirm_threshold <= 0)
+        session->delete_confirm_threshold = MAX_DELETED_FILES_NUM;
+
     int block_size = seafile_session_config_get_int(session, KEY_CDC_AVERAGE_BLOCK_SIZE, NULL);
     if (block_size >= 1024) {
         session->cdc_average_block_size = block_size;
@@ -425,6 +437,20 @@ seafile_session_prepare (SeafileSession *session)
 
     session->disable_block_hash =
         seafile_session_config_get_bool (session, KEY_DISABLE_BLOCK_HASH);
+    
+    char *value = seafile_session_config_get_string(session, KEY_HIDE_WINDOWS_INCOMPATIBLE_PATH_NOTIFICATION);
+    if (g_strcmp0 (value, "false") == 0)
+        session->hide_windows_incompatible_path_notification = FALSE;
+    else 
+        session->hide_windows_incompatible_path_notification = TRUE;
+    g_free (value);
+
+    value = seafile_session_config_get_string(session, KEY_IGNORE_SYMLINKS);
+    if (g_strcmp0 (value, "true") == 0)
+        session->ignore_symlinks = TRUE;
+    else 
+        session->ignore_symlinks = FALSE;
+    g_free (value);
     
     /* Start mq manager earlier, so that we can send notifications
      * when start repo manager. */
@@ -478,10 +504,9 @@ is_repo_store_in_use (const char *repo_id)
     if (seaf_repo_manager_repo_exists (seaf->repo_mgr, repo_id))
         return TRUE;
 
-    char sql[256];
-    snprintf (sql, sizeof(sql), "SELECT 1 FROM CloneTasks WHERE repo_id='%s'",
-              repo_id);
-    if (sqlite_check_for_existence (seaf->clone_mgr->db, sql))
+    if (sqlite_check_for_existence (seaf->clone_mgr->db,
+                                    "SELECT 1 FROM CloneTasks WHERE repo_id=?",
+                                    1, "string", repo_id))
         return TRUE;
 
     return FALSE;
@@ -593,4 +618,3 @@ seafile_session_start (SeafileSession *session)
     /* Finish cleanup task before anything is run. */
     on_start_cleanup (session);
 }
-

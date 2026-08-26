@@ -2,7 +2,7 @@ dnl Process this file with autoconf to produce a configure script.
 
 
 AC_PREREQ(2.61)
-AC_INIT([seafile], [7.0.10], [info@seafile.com])
+AC_INIT([seafile], [9.0.21], [info@seafile.com])
 AC_CONFIG_HEADER([config.h])
 
 AC_CONFIG_MACRO_DIR([m4])
@@ -159,6 +159,7 @@ JANSSON_REQUIRED=2.2.1
 CURL_REQUIRED=7.17
 ZLIB_REQUIRED=1.2.0
 GNUTLS_REQUIRED=3.3.0
+WS_REQUIRED=4.0.20
 
 PKG_CHECK_MODULES(GLIB2, [glib-2.0 >= $GLIB_REQUIRED])
 AC_SUBST(GLIB2_CFLAGS)
@@ -187,6 +188,20 @@ AC_SUBST(ZLIB_LIBS)
 PKG_CHECK_MODULES(CURL, [libcurl >= $CURL_REQUIRED])
 AC_SUBST(CURL_CFLAGS)
 AC_SUBST(CURL_LIBS)
+
+PKG_CHECK_MODULES(ARGON2, [libargon2])
+AC_SUBST(ARGON2_CFLAGS)
+AC_SUBST(ARGON2_LIBS)
+
+AC_ARG_ENABLE(ws, AC_HELP_STRING([--enable-ws], [enable build websockets]),
+  [compile_linux_ws=$enableval],[compile_linux_ws="yes"])
+AM_CONDITIONAL([COMPILE_LINUX_WS], [test "${compile_linux_ws}" = "yes"])
+if test "${compile_linux_ws}" = "yes"; then
+   PKG_CHECK_MODULES(WS, [libwebsockets >= $WS_REQUIRED])
+   AC_DEFINE(COMPILE_LINUX_WS, 1, [compile linux websockets])
+   AC_SUBST(WS_CFLAGS)
+   AC_SUBST(WS_LIBS)
+fi
 
 if test "$bwin32" != true; then
 # do not check libevent_pthreads in win32
@@ -248,6 +263,15 @@ else
    AC_SUBST(SSL_CFLAGS)
    AC_SUBST(SSL_LIBS)
 fi
+
+# option: compile-universal
+# default: no
+AC_ARG_ENABLE([compile-universal],
+[AS_HELP_STRING([--enable-compile-universal],
+[compile seafile universal @<:@default: no@:>@])],
+[compile_universal=${enableval}], [compile_demo=no])
+
+AM_CONDITIONAL([COMPILE_UNIVERSAL], [test x${compile_universal} = xyes])
 
 ac_configure_args="$ac_configure_args -q"
 

@@ -18,6 +18,7 @@
 #include "sync-mgr.h"
 #include "wt-monitor.h"
 #include "mq-mgr.h"
+#include "notif-mgr.h"
 
 #include "http-tx-mgr.h"
 #include "filelock-mgr.h"
@@ -71,6 +72,8 @@ struct _SeafileSession {
 
     SeafFilelockManager *filelock_mgr;
 
+    SeafNotifManager    *notif_mgr;
+
     /* Set after all components are up and running. */
     gboolean             started;
 
@@ -79,6 +82,10 @@ struct _SeafileSession {
     gboolean             disable_verify_certificate;
 
     gboolean             disable_block_hash;
+    
+    gboolean             hide_windows_incompatible_path_notification;
+
+    gboolean             ignore_symlinks;
 
     gboolean             use_http_proxy;
     char                *http_proxy_type;
@@ -86,6 +93,9 @@ struct _SeafileSession {
     int                  http_proxy_port;
     char                *http_proxy_username;
     char                *http_proxy_password;
+    int                 delete_confirm_threshold;
+
+    gboolean check_enc_blocks;
 };
 
 struct _SeafileSessionClass

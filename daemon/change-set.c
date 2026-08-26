@@ -271,14 +271,14 @@ changeset_free (ChangeSet *changeset)
     g_free (changeset);
 }
 
-static void
+static gboolean
 update_file (ChangeSetDirent *dent,
              unsigned char *sha1,
              SeafStat *st,
              const char *modifier)
 {
     if (!sha1 || !st || !S_ISREG(st->st_mode))
-        return;
+        return FALSE;
     dent->mode = create_ce_mode(st->st_mode);
     dent->mtime = (gint64)st->st_mtime;
     dent->size = (gint64)st->st_size;
@@ -286,6 +286,8 @@ update_file (ChangeSetDirent *dent,
 
     g_free (dent->modifier);
     dent->modifier = g_strdup(modifier);
+
+    return TRUE;
 }
 
 static void
@@ -313,11 +315,16 @@ create_new_dent (ChangeSetDir *dir,
 }
 
 static ChangeSetDir *
-create_intermediate_dir (ChangeSetDir *parent, const char *dname)
+create_intermediate_dir (ChangeSetDir *parent, const char *dname, SeafStat *st)
 {
     ChangeSetDirent *dent;
+    gint64 mtime = 0;
 
-    dent = changeset_dirent_new (EMPTY_SHA1, S_IFDIR, dname, 0, NULL, 0);
+    if (st) {
+        mtime = st->st_mtime;
+    }
+
+    dent = changeset_dirent_new (EMPTY_SHA1, S_IFDIR, dname, mtime, NULL, 0);
     dent->subdir = changeset_dir_new (parent->version, EMPTY_SHA1, NULL);
     add_dent_to_dir (parent, dent);
 
@@ -369,6 +376,8 @@ add_to_tree (ChangeSet *changeset,
     ChangeSetDir *dir;
     ChangeSetDirent *dent;
     SeafDir *seaf_dir;
+    GList *parent_dents = NULL;
+    gboolean changed = FALSE;
 
     parts = g_strsplit (path, "/", 0);
     n = g_strv_length(parts);
@@ -400,10 +409,11 @@ add_to_tree (ChangeSet *changeset,
                     seaf_dir_free (seaf_dir);
                 }
                 dir = dent->subdir;
+                parent_dents = g_list_prepend (parent_dents, dent);
             } else if (S_ISREG(dent->mode)) {
                 if (i == (n-1)) {
                     /* File exists, update it. */
-                    update_file (dent, sha1, st, modifier);
+                    changed = update_file (dent, sha1, st, modifier);
                     break;
                 }
             }
@@ -430,11 +440,23 @@ add_to_tree (ChangeSet *changeset,
 
             if (i == (n-1)) {
                 create_new_dent (dir, dname, sha1, st, modifier, new_dent);
+                changed = TRUE;
             } else {
-                dir = create_intermediate_dir (dir, dname);
+                dir = create_intermediate_dir (dir, dname, st);
             }
         }
     }
+
+    if (changed) {
+        GList *ptr;
+        time_t now  = time(NULL);
+        for (ptr = parent_dents; ptr; ptr = ptr->next) {
+            dent = ptr->data;
+            // update parent dir mtime when add or modify or rename files locally.
+            dent->mtime = now;
+        }
+    }
+    g_list_free (parent_dents);
 
     g_strfreev (parts);
 }
@@ -451,6 +473,7 @@ delete_from_tree (ChangeSet *changeset,
     ChangeSetDir *dir;
     ChangeSetDirent *dent, *ret = NULL;
     SeafDir *seaf_dir;
+    GList *parent_dents = NULL;
 
     *parent_empty = FALSE;
 
@@ -488,6 +511,7 @@ delete_from_tree (ChangeSet *changeset,
                 seaf_dir_free (seaf_dir);
             }
             dir = dent->subdir;
+            parent_dents = g_list_prepend (parent_dents, dent);
         } else if (S_ISREG(dent->mode)) {
             if (i == (n-1)) {
                 /* Remove from hash table without freeing dent. */
@@ -499,6 +523,17 @@ delete_from_tree (ChangeSet *changeset,
             }
         }
     }
+
+    if (ret) {
+        GList *ptr;
+        time_t now  = time(NULL);
+        for (ptr = parent_dents; ptr; ptr = ptr->next) {
+            dent = ptr->data;
+            // update parent dir mtime when delete dirs or files locally.
+            dent->mtime = now;
+        }
+    }
+    g_list_free (parent_dents);
 
     g_strfreev (parts);
     return ret;
@@ -588,14 +623,12 @@ remove_from_changeset (ChangeSet *changeset,
 }
 
 static char *
-commit_tree_recursive (const char *repo_id, ChangeSetDir *dir, gint64 *new_mtime)
+commit_tree_recursive (const char *repo_id, ChangeSetDir *dir)
 {
     ChangeSetDirent *dent;
     GHashTableIter iter;
     gpointer key, value;
     char *new_id;
-    gint64 subdir_new_mtime;
-    gint64 dir_mtime = 0;
     SeafDir *seaf_dir;
     char *ret = NULL;
 
@@ -603,16 +636,13 @@ commit_tree_recursive (const char *repo_id, ChangeSetDir *dir, gint64 *new_mtime
     while (g_hash_table_iter_next (&iter, &key, &value)) {
         dent = value;
         if (dent->subdir) {
-            new_id = commit_tree_recursive (repo_id, dent->subdir, &subdir_new_mtime);
+            new_id = commit_tree_recursive (repo_id, dent->subdir);
             if (!new_id)
                 return NULL;
 
             memcpy (dent->id, new_id, 40);
-            dent->mtime = subdir_new_mtime;
             g_free (new_id);
         }
-        if (dir_mtime < dent->mtime)
-            dir_mtime = dent->mtime;
     }
 
     seaf_dir = changeset_dir_to_seaf_dir (dir);
@@ -632,9 +662,6 @@ commit_tree_recursive (const char *repo_id, ChangeSetDir *dir, gint64 *new_mtime
     ret = g_strdup(seaf_dir->dir_id);
 
 out:
-    if (ret != NULL)
-        *new_mtime = dir_mtime;
-
     seaf_dir_free (seaf_dir);
     return ret;
 }
@@ -648,10 +675,8 @@ out:
 char *
 commit_tree_from_changeset (ChangeSet *changeset)
 {
-    gint64 mtime;
     char *root_id = commit_tree_recursive (changeset->repo_id,
-                                           changeset->tree_root,
-                                           &mtime);
+                                           changeset->tree_root);
 
     return root_id;
 }

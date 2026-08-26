@@ -384,8 +384,8 @@ build_checkout_path (const char *worktree, const char *ce_name, int len)
             continue;
         
         if (seaf_util_mkdir (path->str, 0777) < 0) {
-            g_string_free (path, TRUE);
             seaf_warning ("Failed to create directory %s.\n", path->str);
+            g_string_free (path, TRUE);
             return NULL;
         }
     }
@@ -676,8 +676,6 @@ do_check_file_locked (const char *path, const char *worktree, gboolean locked_on
         ret = TRUE;
         goto out;
     }
-    g_free (tmp_name);
-    g_free (fullpath);
 
     /* Sometimes the first two characters are replaced by ~$. */
 
@@ -685,6 +683,8 @@ do_check_file_locked (const char *path, const char *worktree, gboolean locked_on
         goto out;
 
     char *ptr = g_utf8_find_next_char(g_utf8_find_next_char (file_name, NULL), NULL);
+    g_free (tmp_name);
+    g_free (fullpath);
     tmp_name = g_strconcat ("~$", ptr, NULL);
     fullpath = g_build_path ("/", worktree, dir_name, tmp_name, NULL);
     if (g_file_test (fullpath, G_FILE_TEST_IS_REGULAR)) {

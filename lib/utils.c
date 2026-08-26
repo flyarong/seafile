@@ -1,7 +1,5 @@
 /* -*- Mode: C; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*- */
 
-#include <config.h>
-
 #include "common.h"
 
 #ifdef WIN32
@@ -20,21 +18,25 @@
 #include <Rpc.h>
 #include <shlobj.h>
 #include <psapi.h>
+#include <openssl/applink.c>
 
 #else
 #include <arpa/inet.h>
 #endif
 
 #ifndef WIN32
+#include <config.h>
 #include <pwd.h>
 #include <uuid/uuid.h>
 #endif
 
+#ifndef WIN32
 #include <unistd.h>
+#include <dirent.h>
+#endif
 #include <sys/types.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <dirent.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -46,7 +48,17 @@
 
 #include <jansson.h>
 
+#ifndef WIN32
 #include <utime.h>
+#endif
+
+#if defined __linux__ || defined __APPLE__
+#include <sys/xattr.h>
+#endif
+
+#if defined __FreeBSD__ || defined __NetBSD__
+#include <sys/extattr.h>
+#endif
 
 #include <zlib.h>
 
@@ -133,13 +145,18 @@ checkdir (const char *dir)
 int
 checkdir_with_mkdir (const char *dir)
 {
-#ifdef WIN32
     int ret;
+#ifdef WIN32
     char *path = g_strdup(dir);
     char *p = (char *)path + strlen(path) - 1;
     while (*p == '\\' || *p == '/') *p-- = '\0';
     ret = g_mkdir_with_parents(path, 0755);
     g_free (path);
+    return ret;
+#elif defined __APPLE__
+    char *dir_nfd = g_utf8_normalize (dir, -1, G_NORMALIZE_NFD);
+    ret = g_mkdir_with_parents(dir_nfd, 0755);
+    g_free (dir_nfd);
     return ret;
 #else
     return g_mkdir_with_parents(dir, 0755);
@@ -385,9 +402,9 @@ seaf_stat (const char *path, SeafStat *st)
     memset (st, 0, sizeof(SeafStat));
 
     if (attrs.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-        st->st_mode = (S_IFDIR | S_IRWXU);
+        st->st_mode = S_IFDIR;
     else
-        st->st_mode = (S_IFREG | S_IRUSR | S_IWUSR);
+        st->st_mode = S_IFREG;
 
     st->st_atime = file_time_to_unix_time (&attrs.ftLastAccessTime);
     st->st_ctime = file_time_to_unix_time (&attrs.ftCreationTime);
@@ -428,9 +445,9 @@ seaf_stat_from_find_data (WIN32_FIND_DATAW *fdata, SeafStat *st)
     memset (st, 0, sizeof(SeafStat));
 
     if (fdata->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
-        st->st_mode = (S_IFDIR | S_IRWXU);
+        st->st_mode = S_IFDIR;
     else
-        st->st_mode = (S_IFREG | S_IRUSR | S_IWUSR);
+        st->st_mode = S_IFREG;
 
     st->st_atime = file_time_to_unix_time (&fdata->ftLastAccessTime);
     st->st_ctime = file_time_to_unix_time (&fdata->ftCreationTime);
@@ -472,9 +489,9 @@ seaf_set_file_time (const char *path, guint64 mtime)
 int
 seaf_util_unlink (const char *path)
 {
+    int ret = 0;
 #ifdef WIN32
     wchar_t *wpath = win32_long_path (path);
-    int ret = 0;
 
     if (!DeleteFileW (wpath)) {
         ret = -1;
@@ -482,6 +499,11 @@ seaf_util_unlink (const char *path)
     }
 
     g_free (wpath);
+    return ret;
+#elif defined __APPLE__
+    char *path_nfd = g_utf8_normalize (path, -1, G_NORMALIZE_NFD);
+    ret = unlink (path_nfd);
+    g_free (path_nfd);
     return ret;
 #else
     return unlink (path);
@@ -491,9 +513,9 @@ seaf_util_unlink (const char *path)
 int
 seaf_util_rmdir (const char *path)
 {
+    int ret = 0;
 #ifdef WIN32
     wchar_t *wpath = win32_long_path (path);
-    int ret = 0;
 
     if (!RemoveDirectoryW (wpath)) {
         ret = -1;
@@ -501,6 +523,11 @@ seaf_util_rmdir (const char *path)
     }
 
     g_free (wpath);
+    return ret;
+#elif defined __APPLE__
+    char *path_nfd = g_utf8_normalize (path, -1, G_NORMALIZE_NFD);
+    ret = rmdir (path_nfd);
+    g_free (path_nfd);
     return ret;
 #else
     return rmdir (path);
@@ -510,9 +537,9 @@ seaf_util_rmdir (const char *path)
 int
 seaf_util_mkdir (const char *path, mode_t mode)
 {
+    int ret = 0;
 #ifdef WIN32
     wchar_t *wpath = win32_long_path (path);
-    int ret = 0;
 
     if (!CreateDirectoryW (wpath, NULL)) {
         ret = -1;
@@ -520,6 +547,11 @@ seaf_util_mkdir (const char *path, mode_t mode)
     }
 
     g_free (wpath);
+    return ret;
+#elif defined __APPLE__
+    char *path_nfd = g_utf8_normalize (path, -1, G_NORMALIZE_NFD);
+    ret = mkdir (path_nfd, mode);
+    g_free (path_nfd);
     return ret;
 #else
     return mkdir (path, mode);
@@ -558,6 +590,12 @@ seaf_util_open (const char *path, int flags)
 
     g_free (wpath);
     return fd;
+#elif defined __APPLE__
+    int ret = 0;
+    char *path_nfd = g_utf8_normalize (path, -1, G_NORMALIZE_NFD);
+    ret = open (path_nfd, flags);
+    g_free (path_nfd);
+    return ret;
 #else
     return open (path, flags);
 #endif
@@ -595,6 +633,12 @@ seaf_util_create (const char *path, int flags, mode_t mode)
 
     g_free (wpath);
     return fd;
+#elif defined __APPLE__
+    int ret = 0;
+    char *path_nfd = g_utf8_normalize (path, -1, G_NORMALIZE_NFD);
+    ret = open (path_nfd, flags, mode);
+    g_free (path_nfd);
+    return ret;
 #else
     return open (path, flags, mode);
 #endif
@@ -603,10 +647,10 @@ seaf_util_create (const char *path, int flags, mode_t mode)
 int
 seaf_util_rename (const char *oldpath, const char *newpath)
 {
+    int ret = 0;
 #ifdef WIN32
     wchar_t *oldpathw = win32_long_path (oldpath);
     wchar_t *newpathw = win32_long_path (newpath);
-    int ret = 0;
 
     if (!MoveFileExW (oldpathw, newpathw, MOVEFILE_REPLACE_EXISTING)) {
         ret = -1;
@@ -615,6 +659,13 @@ seaf_util_rename (const char *oldpath, const char *newpath)
 
     g_free (oldpathw);
     g_free (newpathw);
+    return ret;
+#elif defined __APPLE__
+    char *oldpath_nfd = g_utf8_normalize (oldpath, -1, G_NORMALIZE_NFD);
+    char *newpath_nfd = g_utf8_normalize (newpath, -1, G_NORMALIZE_NFD);
+    ret = rename (oldpath_nfd, newpath_nfd);
+    g_free (oldpath_nfd);
+    g_free (newpath_nfd);
     return ret;
 #else
     return rename (oldpath, newpath);
@@ -634,6 +685,12 @@ seaf_util_exists (const char *path)
 
     g_free (wpath);
     return ret;
+#elif defined __APPLE__
+    int ret = 0;
+    char *path_nfd = g_utf8_normalize (path, -1, G_NORMALIZE_NFD);
+    ret = access (path_nfd, F_OK);
+    g_free (path_nfd);
+    return (ret == 0);
 #else
     return (access (path, F_OK) == 0);
 #endif
@@ -749,6 +806,13 @@ should_ignore_on_checkout (const char *file_path, IgnoreReason *ignore_reason)
     for (; j < n_comps; ++j) {
         file_name = components[j];
 
+        if (g_strcmp0(file_name, ".") == 0 || g_strcmp0(file_name, "..") == 0) {
+            if (ignore_reason)
+                *ignore_reason = IGNORE_REASON_INVALID_CHARACTER;
+            ret = TRUE;
+            goto out;
+        }
+
         if (has_trailing_space_or_period (file_name)) {
             /* Ignore files/dir whose path has trailing spaces. It would cause
              * problem on windows. */
@@ -780,9 +844,25 @@ should_ignore_on_checkout (const char *file_path, IgnoreReason *ignore_reason)
 
 out:
     g_strfreev (components);
-#endif
-
     return ret;
+#else
+    char **components = g_strsplit (file_path, "/", -1);
+    int n_comps = g_strv_length (components);
+    int j = 0;
+    char *file_name;
+
+    for (; j < n_comps; ++j) {
+        file_name = components[j];
+        if (g_strcmp0(file_name, ".") == 0 || g_strcmp0(file_name, "..") == 0) {
+            ret = TRUE;
+            if (ignore_reason)
+                *ignore_reason = IGNORE_REASON_INVALID_CHARACTER;
+            break;
+        }
+    }
+    g_strfreev (components);
+    return ret;
+#endif
 }
 
 ssize_t						/* Read "n" bytes from a descriptor. */
@@ -1279,9 +1359,9 @@ char* gen_uuid ()
     UUID uuid;
 
     UuidCreate(&uuid);
-    UuidToString(&uuid, &str);
+    UuidToStringA(&uuid, &str);
     memcpy(uuid_str, str, 37);
-    RpcStringFree(&str);
+    RpcStringFreeA(&str);
     return uuid_str;
 }
 
@@ -1291,9 +1371,9 @@ void gen_uuid_inplace (char *buf)
     UUID uuid;
 
     UuidCreate(&uuid);
-    UuidToString(&uuid, &str);
+    UuidToStringA(&uuid, &str);
     memcpy(buf, str, 37);
-    RpcStringFree(&str);
+    RpcStringFreeA(&str);
 }
 
 gboolean
@@ -1303,7 +1383,7 @@ is_uuid_valid (const char *uuid_str)
         return FALSE;
 
     UUID uuid;
-    if (UuidFromString((unsigned char *)uuid_str, &uuid) != RPC_S_OK)
+    if (UuidFromStringA((unsigned char *)uuid_str, &uuid) != RPC_S_OK)
         return FALSE;
     return TRUE;
 }
@@ -1806,7 +1886,7 @@ get_process_handle (const char *process_name_in)
             continue;
             
         if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded)) {
-            GetModuleBaseName(hProcess, hMod, process_name, 
+            GetModuleBaseNameA(hProcess, hMod, process_name, 
                               sizeof(process_name)/sizeof(char));
         }
 
@@ -1853,7 +1933,7 @@ int count_process (const char *process_name_in)
             
         if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
             for (j = 0; j < cbNeeded / sizeof(HMODULE); j++) {
-                if (GetModuleBaseName(hProcess, hMods[j], process_name,
+                if (GetModuleBaseNameA(hProcess, hMods[j], process_name,
                                       sizeof(process_name))) {
                     if (strcasecmp(process_name, name) == 0)
                         count++;
@@ -2477,4 +2557,292 @@ canonical_server_url (const char *url_in)
         url[len - 1] = 0;
 
     return url;
+}
+
+#ifdef __APPLE__
+static gboolean
+case_conflict_recursive (const char *worktree, const char *path, char **conflict_path, GHashTable *no_case_conflict_hash)
+{
+    if (!path || g_strcmp0 (path, ".") == 0) {
+        return FALSE;
+    }
+
+    if (g_hash_table_lookup (no_case_conflict_hash, path)) {
+        return FALSE;
+    }
+
+    SeafStat st;
+    gboolean ret = FALSE;
+    int fd = -1;
+    char *full_path = g_build_path ("/", worktree, path, NULL);
+    char *no_conflict_path = NULL;
+
+    if (seaf_stat (full_path, &st) < 0) {
+        char *sub_path = g_path_get_dirname (path);
+        ret = case_conflict_recursive (worktree, sub_path, conflict_path, no_case_conflict_hash);
+        g_free (sub_path);
+        goto out;
+    }
+
+    int len = strlen (path);
+    fd = open (full_path, O_RDONLY);
+    if (fd < 0) {
+        goto out;
+    }
+    char buffer[SEAF_PATH_MAX];
+    if (fcntl (fd, F_GETPATH, buffer) < 0) {
+        goto out;
+    }
+    int offset = strlen (buffer) - len;
+    if (strcasecmp (buffer + offset, path) == 0 &&
+        strcmp (buffer + offset, path) != 0) {
+        if (conflict_path) {
+            *conflict_path = g_strdup(path);
+        }
+        ret = TRUE;
+        goto out;
+    } else {
+        no_conflict_path = g_strdup (path);
+        g_hash_table_insert (no_case_conflict_hash, no_conflict_path, no_conflict_path);
+    }
+    
+out:
+    if (fd >= 0)
+        close (fd);
+    g_free (full_path);
+    return ret;
+}
+#elif defined WIN32
+static gboolean
+case_conflict_recursive (const char *worktree, const char *path, char **conflict_path, GHashTable *no_case_conflict_hash)
+{
+    if (!path || g_strcmp0 (path, ".") == 0) {
+        return FALSE;
+    }
+
+    if (g_hash_table_lookup (no_case_conflict_hash, path)) {
+        return FALSE;
+    }
+
+    SeafStat st;
+    gboolean ret = FALSE;
+    int fd = -1;
+    char *full_path = g_build_path ("/", worktree, path, NULL);
+    wchar_t *wpath = win32_long_path (full_path);
+    char *no_conflict_path = NULL;
+
+    if (seaf_stat (full_path, &st) < 0) {
+        char *sub_path = g_path_get_dirname (path);
+        ret = case_conflict_recursive (worktree, sub_path, conflict_path, no_case_conflict_hash);
+        if (!ret) {
+            no_conflict_path = g_strdup (sub_path);
+            g_hash_table_insert (no_case_conflict_hash, no_conflict_path, no_conflict_path);
+        }
+        g_free (sub_path);
+        goto out;
+    }
+
+    HANDLE handle;
+    WIN32_FIND_DATAW fdata;
+    handle = FindFirstFileW (wpath, &fdata);
+    if (handle == INVALID_HANDLE_VALUE) {
+        seaf_warning ("Checkinng path case, FindFirstFile failed %s: %lu.\n", full_path, GetLastError());
+        goto out;
+    }
+    char *real_name = g_utf16_to_utf8 (fdata.cFileName, -1, NULL, NULL, NULL);
+    int offset = strlen (path) - strlen(real_name);
+    if (strcasecmp (path + offset, real_name) == 0 &&
+        strcmp (path + offset, real_name) != 0) {
+        if (conflict_path) {
+            *conflict_path = g_strdup(path);
+        }
+        ret = TRUE;
+        g_free (real_name);
+        FindClose (handle);
+        goto out;
+    }
+    g_free (real_name);
+    FindClose (handle);
+
+    char *sub_path = g_path_get_dirname (path);
+    ret = case_conflict_recursive (worktree, sub_path, conflict_path, no_case_conflict_hash);
+    g_free (sub_path);
+
+out:
+    g_free (full_path);
+    g_free (wpath);
+    return ret;
+}
+#else
+static gboolean
+case_conflict_recursive (const char *worktree, const char *path, char **conflict_path, GHashTable *no_case_conflict_hash)
+{
+    return FALSE;
+}
+#endif
+
+gboolean
+is_path_case_conflict (const char *worktree, const char *path, char **conflict_path, GHashTable *no_case_conflict_hash)
+{
+    if (strlen(path) >= SEAF_PATH_MAX) {
+        return FALSE;
+    }
+    if (case_conflict_recursive (worktree, path, conflict_path, no_case_conflict_hash))
+        return TRUE;
+#ifdef WIN32
+    char *no_conflict_path = g_strdup (path);
+    g_hash_table_insert (no_case_conflict_hash, no_conflict_path, no_conflict_path);
+#endif
+    return FALSE;
+}
+
+ssize_t
+seaf_getxattr (const char *path, const char *name, void *value, size_t size)
+{
+#ifdef WIN32
+    /* On Windows, use alternate data streams for xattrs. */
+
+    char *stream_path;
+    wchar_t *w_stream_path;
+    HANDLE handle;
+    LARGE_INTEGER stream_size;
+    DWORD n_to_read, n_read;
+    ssize_t ret;
+
+    stream_path = g_strconcat (path, ":", name, NULL);
+    w_stream_path = win32_long_path (stream_path);
+    g_free (stream_path);
+
+    handle = CreateFileW (w_stream_path,
+                          GENERIC_READ,
+                          FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          NULL,
+                          OPEN_EXISTING,
+                          0,
+                          NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = windows_error_to_errno (GetLastError());
+        ret = -1;
+        goto out;
+    }
+
+    if (!GetFileSizeEx (handle, &stream_size)) {
+        errno = windows_error_to_errno (GetLastError());
+        ret = -1;
+        goto out;
+    }
+
+    n_to_read = MIN (stream_size.LowPart, size);
+    if (!ReadFile (handle, value, n_to_read, &n_read, NULL)) {
+        errno = windows_error_to_errno (GetLastError());
+        ret = -1;
+        goto out;
+    }
+
+    ret = (ssize_t)n_read;
+
+out:
+    g_free (w_stream_path);
+    if (handle != INVALID_HANDLE_VALUE)
+        CloseHandle(handle);
+    return ret;
+#endif
+
+#ifdef __linux__
+    return getxattr (path, name, value, size);
+#endif
+
+#ifdef __APPLE__
+    return getxattr (path, name, value, size, 0, 0);
+#endif
+
+#if defined __FreeBSD__ || defined __NetBSD__
+    return extattr_get_file (path, EXTATTR_NAMESPACE_USER, name, value, size);
+#endif
+
+    return -1;
+}
+
+int
+seaf_setxattr (const char *path, const char *name, const void *value, size_t size)
+{
+#ifdef WIN32
+    char *stream_path;
+    wchar_t *w_stream_path;
+    HANDLE handle;
+    DWORD n_written;
+    ssize_t ret = 0;
+
+    stream_path = g_strconcat (path, ":", name, NULL);
+    w_stream_path = win32_long_path (stream_path);
+    g_free (stream_path);
+
+    handle = CreateFileW (w_stream_path,
+                          GENERIC_WRITE,
+                          FILE_SHARE_DELETE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                          NULL,
+                          OPEN_ALWAYS,
+                          0,
+                          NULL);
+    if (handle == INVALID_HANDLE_VALUE) {
+        errno = windows_error_to_errno (GetLastError());
+        ret = -1;
+        goto out;
+    }
+
+    if (!WriteFile (handle, value, (DWORD)size, &n_written, NULL)) {
+        errno = windows_error_to_errno (GetLastError());
+        ret = -1;
+    }
+
+out:
+    g_free (w_stream_path);
+    if (handle != INVALID_HANDLE_VALUE)
+        CloseHandle(handle);
+    return ret;
+#endif
+
+#ifdef __linux__
+    return setxattr (path, name, value, size, 0);
+#endif
+
+#ifdef __APPLE__
+    return setxattr (path, name, value, size, 0, 0);
+#endif
+
+#if defined __FreeBSD__ || defined __NetBSD__
+    return extattr_set_file (path, EXTATTR_NAMESPACE_USER, name, value, size);
+#endif
+
+    return -1;
+}
+
+int
+seaf_removexattr (const char *path, const char *name)
+{
+#ifdef WIN32
+    char *stream_path;
+    wchar_t *w_stream_path;
+    int ret = 0;
+
+    stream_path = g_strconcat (path, ":", name, NULL);
+    w_stream_path = win32_long_path (stream_path);
+    g_free (stream_path);
+
+    if (!DeleteFileW (w_stream_path)) {
+        errno = windows_error_to_errno (GetLastError());
+        ret = -1;
+    }
+
+    g_free (w_stream_path);
+    return ret;
+#else
+
+#ifdef __APPLE__
+    return removexattr (path, name, 0);
+#else
+    return removexattr (path, name);
+#endif
+
+#endif
 }

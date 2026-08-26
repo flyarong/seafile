@@ -10,6 +10,7 @@
 #include "seafile-object.h"
 #include "commit-mgr.h"
 #include "branch-mgr.h"
+#include "http-tx-mgr.h"
 
 #define REPO_AUTO_SYNC        "auto-sync"
 #define REPO_RELAY_ID         "relay-id"
@@ -24,6 +25,9 @@
 #define REPO_PROP_SERVER_URL  "server-url"
 #define REPO_PROP_SYNC_INTERVAL "sync-interval"
 #define REPO_SYNC_WORKTREE_NAME "sync-worktree-name"
+#define REPO_PROP_USERNAME "username"
+#define REPO_PROP_EMPTY_ENC_KEY "empty-enc-key"
+#define REPO_PROP_CHECK_BLOCKS "check-blocks"
 
 struct _SeafRepoManager;
 typedef struct _SeafRepo SeafRepo;
@@ -44,6 +48,9 @@ struct _SeafRepo {
     int         enc_version;
     gchar       salt[65];
     gchar       magic[65];       /* hash(repo_id + passwd), key stretched. */
+    gchar       pwd_hash[65];       /* hash(repo_id + passwd), key stretched. */
+    gchar       *pwd_hash_algo;
+    gchar       *pwd_hash_params;
     gchar       random_key[97];  /* key length is 48 after encryption */
     gboolean    no_local_history;
     gint64 last_modify;
@@ -68,7 +75,11 @@ struct _SeafRepo {
     unsigned char enc_iv[16];
 
     gchar      *email;          /* email of the user on the relay */
+    gchar      *username;
     gchar      *token;          /* token for access this repo on server */
+
+    gchar      *jwt_token;
+    gint64     last_check_jwt_token;
 
     pthread_mutex_t lock;
 
@@ -96,6 +107,9 @@ struct _SeafRepo {
 
     /* Non-zero if periodic sync is set for this repo. */
     int sync_interval;
+
+    // empty_enc_key will be set to true when the currently loadded enc key is empty, or when blocks can be decrypted using an empty enc key.
+    gboolean empty_enc_key;
 };
 
 
@@ -279,6 +293,16 @@ seaf_repo_manager_set_repo_passwd (SeafRepoManager *manager,
                                    SeafRepo *repo,
                                    const char *passwd);
 
+int 
+seaf_repo_manager_save_repo_enc_info (SeafRepoManager *manager,
+                                      const char *repo_id,
+                                      const char *key,
+                                      const char *iv);
+
+int 
+seaf_repo_manager_load_repo_enc_info (SeafRepoManager *manager,
+                                     SeafRepo *repo);
+
 int
 seaf_repo_manager_update_repos_server_host (SeafRepoManager *mgr,
                                             const char *old_server_url,
@@ -324,6 +348,20 @@ struct _HttpTxTask;
 int
 seaf_repo_fetch_and_checkout (struct _HttpTxTask *http_task,
                               const char *remote_head_id);
+
+int
+seaf_repo_manager_checkout_file (SeafRepo *repo,
+                                 const char *file_id,
+                                 const char *file_path,
+                                 guint32 mode,
+                                 guint64 mtime,
+                                 SeafileCrypt *crypt,
+                                 const char *in_repo_path,
+                                 const char *conflict_head_id,
+                                 gboolean force_conflict,
+                                 gboolean *conflicted,
+                                 const char *email,
+                                 CheckoutBlockAux *aux);
 
 gboolean
 seaf_repo_manager_is_ignored_hidden_file (const char *filename);
@@ -378,6 +416,18 @@ typedef struct _FolderPerm {
 
 void
 folder_perm_free (FolderPerm *perm);
+
+int
+seaf_repo_manager_delete_folder_perm (SeafRepoManager *mgr,
+                                      const char *repo_id,
+                                      FolderPermType type,
+                                      FolderPerm *perm);
+
+int
+seaf_repo_manager_update_folder_perm (SeafRepoManager *mgr,
+                                      const char *repo_id,
+                                      FolderPermType type,
+                                      FolderPerm *perm);
 
 int
 seaf_repo_manager_update_folder_perms (SeafRepoManager *mgr,

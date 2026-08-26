@@ -5,9 +5,13 @@
 #ifdef WIN32
 #include <windows.h>
 #include <wincrypt.h>
+#include <shellapi.h>
 #endif
 
+#ifndef WIN32
 #include <unistd.h>
+#include <sys/file.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -22,6 +26,10 @@
 #ifdef HAVE_BREAKPAD_SUPPORT
 #include <c_bpwrapper.h>
 #endif // HAVE_BREAKPAD_SUPPORT
+
+#ifdef ENABLE_BREAKPAD
+#include "c_bpwrapper.h"
+#endif // ENABLE_BREAKPAD
 
 #include <searpc.h>
 #include <searpc-named-pipe-transport.h>
@@ -84,6 +92,11 @@ register_rpc_service ()
                                      seafile_sync_error_id_to_str,
                                      "seafile_sync_error_id_to_str",
                                      searpc_signature_string__int());
+
+    searpc_server_register_function ("seafile-rpcserver",
+                                     seafile_add_del_confirmation,
+                                     "seafile_add_del_confirmation",
+                                     searpc_signature_int__string_int());
 
     searpc_server_register_function ("seafile-rpcserver",
                                      seafile_get_config,
@@ -242,7 +255,7 @@ register_rpc_service ()
     searpc_server_register_function ("seafile-rpcserver",
                                      seafile_generate_magic_and_random_key,
                                      "seafile_generate_magic_and_random_key",
-                                     searpc_signature_object__int_string_string());
+                                     searpc_signature_object__int_string_string_string_string());
 
     searpc_server_register_function ("seafile-rpcserver",
                                      seafile_get_server_property,
@@ -286,7 +299,7 @@ char *b64encode(const char *input)
 {
     char buf[32767] = {0};
     DWORD retlen = 32767;
-    CryptBinaryToString((BYTE*) input, strlen(input), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, buf, &retlen);
+    CryptBinaryToStringA((BYTE*) input, strlen(input), CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, buf, &retlen);
     return strdup(buf);
 }
 #endif
@@ -297,9 +310,9 @@ start_searpc_server ()
     register_rpc_service ();
 
 #ifdef WIN32
-    DWORD bufCharCount = 32767;
-    char userNameBuf[bufCharCount];
-    if (GetUserName(userNameBuf, &bufCharCount) == 0) {
+    char userNameBuf[32767];
+    DWORD bufCharCount = sizeof(userNameBuf);
+    if (GetUserNameA(userNameBuf, &bufCharCount) == 0) {
         seaf_warning ("Failed to get user name, GLE=%lu, required size is %lu\n",
                       GetLastError(), bufCharCount);
         return -1;
@@ -357,10 +370,32 @@ get_argv_utf8 (int *argc)
 }
 #endif
 
+#ifdef __linux__
+static int
+write_pidfile (char *pidfile)
+{
+    int fd = open (pidfile, O_WRONLY | O_CREAT, 0644);
+    if (fd < 0) {
+        seaf_warning ("Failed to open pidfile %s: %s\n",
+                      pidfile, strerror(errno));
+        return -1;
+    }
+
+    if (flock (fd, LOCK_EX | LOCK_NB) < 0 && errno != ENOSYS) {
+        seaf_warning ("Failed to lock pidfile %s: %s\n",
+                      pidfile, strerror(errno));
+        close (fd);
+        return -1;
+    }
+
+    return 0;
+}
+#endif
+
 int
 main (int argc, char **argv)
 {
-#ifdef HAVE_BREAKPAD_SUPPORT
+#if defined(HAVE_BREAKPAD_SUPPORT) || defined(ENABLE_BREAKPAD)
 #ifdef WIN32
 #define DUMPS_DIR "~/ccnet/logs/dumps/"
 #else
@@ -382,6 +417,8 @@ main (int argc, char **argv)
     char *seafile_dir = NULL;
     char *worktree_dir = NULL;
     char *logfile = NULL;
+    char *eventfile = NULL;
+    char *pidfile = NULL;
     const char *debug_str = NULL;
     int daemon_mode = 0;
     char *ccnet_debug_level_str = "info";
@@ -489,6 +526,16 @@ main (int argc, char **argv)
         exit (1);
     }
 
+    eventfile = g_build_filename (config_dir, "logs", "events.log", NULL);
+    if (seafile_event_log_init (eventfile) < 0) {
+        seaf_warning ("Failed to init event log.\n");
+        exit (1);
+    }
+
+    seafile_event_message("Starting record seafile events.\n");
+
+    seafile_log_rotate_start ();
+
     /* init seafile */
     if (seafile_dir == NULL)
         seafile_dir = g_build_filename (config_dir, "seafile-data", NULL);
@@ -501,6 +548,15 @@ main (int argc, char **argv)
         exit (1);
     }
 
+
+    pidfile = g_build_filename (seafile_dir, "seaf-daemon.pid", NULL);
+#ifdef __linux__
+    if (write_pidfile (pidfile) < 0) {
+        seaf_message ("The seafile data directory %s is already used by another Seafile client instance. Please use another configuration directory.\n", seafile_dir);
+        exit (1);
+    }
+#endif
+
     seaf_message ("starting seafile client "SEAFILE_CLIENT_VERSION"\n");
 #if defined(SEAFILE_SOURCE_COMMIT_ID)
     seaf_message ("seafile source code version "SEAFILE_SOURCE_COMMIT_ID"\n");
@@ -509,6 +565,8 @@ main (int argc, char **argv)
     g_free (seafile_dir);
     g_free (worktree_dir);
     g_free (logfile);
+    g_free (eventfile);
+    g_free (pidfile);
 
 #ifndef WIN32
     set_signal_handlers (seaf);

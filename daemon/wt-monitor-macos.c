@@ -16,9 +16,19 @@
 #define DEBUG_FLAG SEAFILE_DEBUG_WATCH
 #include "log.h"
 
+#define RENAME_EXPIRE_TIME 10
+
+typedef struct RenameInfo {
+    char *old_path;
+    char *old_event_path;
+    gboolean processing;
+    gint64 expire;
+} RenameInfo;
+
 typedef struct RepoWatchInfo {
     WTStatus *status;
     char *worktree;
+    RenameInfo *rename_info;
 } RepoWatchInfo;
 
 struct SeafWTMonitorPriv {
@@ -33,6 +43,27 @@ add_event_to_queue (WTStatus *status,
 
 static void handle_watch_command (SeafWTMonitor *monitor, WatchCommand *cmd);
 
+inline static void
+set_rename_processing_state (RenameInfo *info, const char *path, const char *event_path)
+{
+    gint64 now = (gint64)time(NULL);
+    info->old_path = g_strdup(path);
+    info->old_event_path = g_strdup(event_path);
+    info->processing = TRUE;
+    info->expire = now + RENAME_EXPIRE_TIME;
+}
+
+inline static void
+unset_rename_processing_state (RenameInfo *info)
+{
+    g_free (info->old_path);
+    g_free (info->old_event_path);
+    info->old_path = NULL;
+    info->old_event_path = NULL;
+    info->processing = FALSE;
+    info->expire = 0;
+}
+
 /* RepoWatchInfo */
 
 static RepoWatchInfo *
@@ -43,6 +74,7 @@ create_repo_watch_info (const char *repo_id, const char *worktree)
     RepoWatchInfo *info = g_new0 (RepoWatchInfo, 1);
     info->status = status;
     info->worktree = g_strdup(worktree);
+    info->rename_info = g_new0 (RenameInfo, 1);
 
     return info;
 }
@@ -52,7 +84,136 @@ free_repo_watch_info (RepoWatchInfo *info)
 {
     wt_status_unref (info->status);
     g_free (info->worktree);
+    g_free (info->rename_info->old_path);
+    g_free (info->rename_info);
     g_free (info);
+}
+
+// Since macOS does not distinguish filename case, we need to perform an additional check during rename operations to verify that the filename matches the actual name exactly.
+static gboolean
+is_filename_case_conflict (const char *eventPath)
+{
+    gboolean ret = FALSE;
+    int fd = -1;
+
+    fd = open (eventPath, O_RDONLY);
+    if (fd < 0) {
+        goto out;
+    }
+
+    char buffer[SEAF_PATH_MAX];
+    if (fcntl (fd, F_GETPATH, buffer) < 0) {
+        goto out;
+    }
+
+    if (strcasecmp (buffer, eventPath) == 0 &&
+        strcmp (buffer, eventPath) != 0) {
+        ret = TRUE;
+    }
+
+out:
+    if (fd >= 0)
+        close (fd);
+    return ret;
+}
+
+static void
+check_and_handle_rename (WTStatus *status, RenameInfo *rename_info,
+                        const char *eventPath, const char *filename)
+{
+    struct stat st;
+    gboolean old_path_exists = TRUE;
+    gboolean new_path_exists = TRUE;
+
+    if ((stat (rename_info->old_event_path, &st) < 0 && errno == ENOENT) ||
+         is_filename_case_conflict (rename_info->old_event_path)) {
+        old_path_exists = FALSE;
+    }
+    if ((stat (eventPath, &st) < 0 && errno == ENOENT) ||
+         is_filename_case_conflict (eventPath)) {
+        new_path_exists = FALSE;
+    }
+
+    if (!old_path_exists && new_path_exists) {
+        seaf_debug ("Rename dir %s to %s\n", rename_info->old_path, filename);
+        add_event_to_queue (status, WT_EVENT_RENAME, rename_info->old_path, filename);
+    } else {
+        if (old_path_exists) {
+            seaf_debug ("Rename: old path exist, add create event for %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, rename_info->old_path, NULL);
+        } else {
+            seaf_debug ("Rename: old path doesn't exist, add delete event for %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_DELETE, rename_info->old_path, NULL);
+        }
+        if (new_path_exists) {
+            seaf_debug ("Rename: new path exist, add create event for %s\n", filename);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
+        } else {
+            seaf_debug ("Rename: new path doesn't exist, add delete event for %s\n", filename);
+            add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
+        }
+    }
+
+    unset_rename_processing_state (rename_info);
+}
+
+static void
+handle_rename (RepoWatchInfo *info,
+               const FSEventStreamEventFlags eventFlags,
+               const char *eventPath,
+               const char *filename)
+{
+    WTStatus *status = info->status;
+    RenameInfo *rename_info = info->rename_info;
+    gboolean is_dir = FALSE;
+    gint64 now = (gint64)time(NULL);
+
+    // If processing is set for more than 10 seconds, the system may not generate paired renaming events.
+    // In this case, we add creation event or deletion event based on whether the file exists.
+    if (rename_info->expire > 0 && now >= rename_info->expire) {
+        struct stat st;
+        if ((stat (rename_info->old_event_path, &st) < 0 && errno == ENOENT) || is_filename_case_conflict (eventPath)) {
+            seaf_debug ("Rename info expired, delete renamed dir %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_DELETE, rename_info->old_path, NULL);
+        } else {
+            seaf_debug ("Rename info expired, create renamed dir %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, rename_info->old_path, NULL);
+        }
+        unset_rename_processing_state (rename_info);
+    }
+
+    if (!(eventFlags & kFSEventStreamEventFlagItemRenamed)) {
+        return;
+    }
+
+    seaf_debug ("Rename flag set for %s \n", filename);
+
+    if (eventFlags & kFSEventStreamEventFlagItemIsDir) {
+        is_dir = TRUE;
+    }
+
+    // It is not always possible to reliably determine if a file has been renamed on  Mac, as system events do not guarantee that renamed files appear consecutively.
+    // However, we can detect directory renaming, and handling directory renaming is generally not overly complex.
+    if (is_dir) {
+        if (!rename_info->processing) {
+            seaf_debug ("Move %s ->\n", filename);
+            set_rename_processing_state (rename_info, filename, eventPath);
+        } else {
+            seaf_debug ("Move -> %s.\n", filename);
+            // If a dir is renamed, the old path should not exist, and the new path should exist.
+            // If this condition is not met, split the renaming event into deletion event or creation event based on whether the dir exists.
+            check_and_handle_rename (status, rename_info, eventPath, filename);
+        }
+    } else {
+        struct stat st;
+        if ((stat (eventPath, &st) < 0 && errno == ENOENT) || is_filename_case_conflict (eventPath)) {
+            seaf_debug ("Delete renamed file %s\n", filename);
+            add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
+        } else {
+            seaf_debug ("Create renamed file %s\n", filename);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
+        }
+    }
 }
 
 static void
@@ -117,7 +278,8 @@ process_one_event (const char* eventPath,
                    RepoWatchInfo *info,
                    const char *worktree,
                    const FSEventStreamEventId eventId,
-                   const FSEventStreamEventFlags eventFlags)
+                   const FSEventStreamEventFlags eventFlags,
+                   gboolean last_event)
 {
     WTStatus *status = info->status;
     char *filename;
@@ -138,17 +300,7 @@ process_one_event (const char* eventPath,
     if (len > 0 && filename[len - 1] == '/')
         filename[len - 1] = 0;
 
-    /* Reinterpreted RENAMED as combine of CREATED or DELETED event */
-    if (eventFlags & kFSEventStreamEventFlagItemRenamed) {
-        seaf_debug ("Rename flag set for %s \n", filename);
-        if (stat (eventPath, &buf) < 0) {
-            /* ret = -1, file is gone */
-            add_event_to_queue (status, WT_EVENT_DELETE, filename, NULL);
-        } else {
-            /* ret = 0, file is here, but rename behaviour is unknown to us */
-            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
-        }
-    }
+    handle_rename (info, eventFlags, eventPath, filename);
 
     if (eventFlags & kFSEventStreamEventFlagItemRemoved) {
         seaf_debug ("Deleted flag set for %s.\n", filename);
@@ -177,6 +329,19 @@ process_one_event (const char* eventPath,
         if (stat (eventPath, &buf) == 0) {
             add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, filename, NULL);
         }
+    }
+
+    // If this is the last event, check rename_info and split the renaming event into deletion event or creation event.
+    RenameInfo *rename_info = info->rename_info;
+    if (last_event && rename_info->processing) {
+        if (stat (rename_info->old_event_path, &buf) < 0 && errno == ENOENT) {
+            seaf_debug ("Delete renamed file %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_DELETE, rename_info->old_path, NULL);
+        } else {
+            seaf_debug ("Create renamed file %s\n", rename_info->old_path);
+            add_event_to_queue (status, WT_EVENT_CREATE_OR_UPDATE, rename_info->old_path, NULL);
+        }
+        unset_rename_processing_state (rename_info);
     }
 
     g_free (filename);
@@ -254,7 +419,7 @@ stream_callback (ConstFSEventStreamRef streamRef,
         seaf_debug("%ld Change %llu in %s, flags %x\n", (long)CFRunLoopGetCurrent(),
                    eventIds[i], paths[i], eventFlags[i]);
         process_one_event (paths[i], info, info->worktree,
-                           eventIds[i], eventFlags[i]);
+                           eventIds[i], eventFlags[i], i==(numEvents - 1));
     }
 }
 

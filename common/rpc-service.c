@@ -5,7 +5,9 @@
 #include <ctype.h>
 
 #include <sys/stat.h>
+#ifndef WIN32
 #include <dirent.h>
+#endif
 #include "utils.h"
 
 #include "seafile-session.h"
@@ -17,6 +19,7 @@
 #include "seafile-config.h"
 #include "seafile-object.h"
 #include "seafile-error-impl.h"
+#include "password-hash.h"
 #define DEBUG_FLAG SEAFILE_DEBUG_OTHER
 #include "log.h"
 
@@ -377,6 +380,30 @@ seafile_get_repo_sync_task (const char *repo_id, GError **error)
         return NULL;
     }
 
+    if (!repo->token) {
+        SeafileSyncTask *s_task;
+        s_task = g_object_new (SEAFILE_TYPE_SYNC_TASK,
+                               "force_upload", FALSE,
+                               "state", "error",
+                               "error", SYNC_ERROR_ID_STOPPED_BY_LOGOUT,
+                               "repo_id", repo_id,
+                               NULL);
+
+        return (GObject *)s_task;
+    }
+
+    if (repo->empty_enc_key) {
+        SeafileSyncTask *s_task;
+        s_task = g_object_new (SEAFILE_TYPE_SYNC_TASK,
+                               "force_upload", FALSE,
+                               "state", "error",
+                               "error", SYNC_ERROR_ID_CORRUPTED_ENC_KEY,
+                               "repo_id", repo_id,
+                               NULL);
+
+        return (GObject *)s_task;
+    }
+
     SyncInfo *info = seaf_sync_manager_get_sync_info (seaf->sync_mgr, repo_id);
     if (!info || !info->current_task)
         return NULL;
@@ -567,7 +594,7 @@ seafile_mark_file_locked (const char *repo_id, const char *path, GError **error)
         canon_path[len-1] = 0;
 
     ret = seaf_filelock_manager_mark_file_locked (seaf->filelock_mgr,
-                                                  repo_id, path, FALSE);
+                                                  repo_id, path, LOCKED_MANUAL);
 
     g_free (canon_path);
     return ret;
@@ -765,9 +792,9 @@ seafile_unsync_repos_by_account (const char *server_url, const char *email, GErr
     }
 
     g_list_free (repos);
-    g_free (canon_server_url);
 
-    cancel_clone_tasks_by_account (server_url, email);
+    cancel_clone_tasks_by_account (canon_server_url, email);
+    g_free (canon_server_url);
 
     return 0;
 }
@@ -796,9 +823,9 @@ seafile_remove_repo_tokens_by_account (const char *server_url, const char *email
     }
 
     g_list_free (repos);
-    g_free (canon_server_url);
 
-    cancel_clone_tasks_by_account (server_url, email);
+    cancel_clone_tasks_by_account (canon_server_url, email);
+    g_free (canon_server_url);
 
     return 0;
 }
@@ -861,6 +888,8 @@ GObject *
 seafile_generate_magic_and_random_key(int enc_version,
                                       const char* repo_id,
                                       const char *passwd,
+                                      const char *pwd_hash_algo,
+                                      const char *pwd_hash_params,
                                       GError **error)
 {
     if (!repo_id || !passwd) {
@@ -870,13 +899,19 @@ seafile_generate_magic_and_random_key(int enc_version,
 
     gchar salt[65] = {0};
     gchar magic[65] = {0};
+    gchar pwd_hash[65] = {0};
     gchar random_key[97] = {0};
 
     if (enc_version >= 3 && seafile_generate_repo_salt (salt) < 0) {
         return NULL;
     }
 
-    seafile_generate_magic (enc_version, repo_id, passwd, salt, magic);
+    if (g_strcmp0 (pwd_hash_algo, PWD_HASH_PDKDF2) == 0 ||
+        g_strcmp0 (pwd_hash_algo, PWD_HASH_ARGON2ID) == 0) {
+        seafile_generate_pwd_hash (enc_version, repo_id, passwd, salt, pwd_hash_algo, pwd_hash_params, pwd_hash);
+    } else {
+        seafile_generate_magic (enc_version, repo_id, passwd, salt, magic);
+    }
     if (seafile_generate_random_key (passwd, enc_version, salt, random_key) < 0) {
         return NULL;
     }
@@ -887,6 +922,7 @@ seafile_generate_magic_and_random_key(int enc_version,
                           "passwd", passwd,
                           "enc_version", enc_version,
                           "magic", magic,
+                          "pwd_hash", pwd_hash,
                           "random_key", random_key,
                           NULL);
 
@@ -985,4 +1021,10 @@ char*
 seafile_sync_error_id_to_str (int error_id, GError **error)
 {
     return g_strdup(sync_error_id_to_str (error_id));
+}
+
+int
+seafile_add_del_confirmation (const char *confirmation_id, int resync, GError **error)
+{
+    return seaf_sync_manager_add_del_confirmation (seaf->sync_mgr, confirmation_id, resync);
 }

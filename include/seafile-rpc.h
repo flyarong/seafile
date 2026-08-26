@@ -208,6 +208,8 @@ GObject *
 seafile_generate_magic_and_random_key(int enc_version,
                                       const char* repo_id,
                                       const char *passwd,
+                                      const char *pwd_hash_algo,
+                                      const char *pwd_hash_params,
                                       GError **error);
 json_t * seafile_get_sync_notification (GError **error);
 
@@ -216,4 +218,7 @@ seafile_shutdown (GError **error);
 
 char*
 seafile_sync_error_id_to_str (int error_id, GError **error);
+
+int
+seafile_add_del_confirmation (const char *confirmation_id, int resync, GError **error);
 #endif

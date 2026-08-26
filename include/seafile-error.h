@@ -60,6 +60,16 @@
 #define SYNC_ERROR_ID_GENERAL_ERROR             28
 #define SYNC_ERROR_ID_NO_ERROR                  29
 #define SYNC_ERROR_ID_REMOVE_UNCOMMITTED_FOLDER 30
-#define N_SYNC_ERROR_ID                         31
+#define SYNC_ERROR_ID_INVALID_PATH_ON_WINDOWS   31
+#define SYNC_ERROR_ID_LIBRARY_TOO_LARGE         32
+#define SYNC_ERROR_ID_DEL_CONFIRMATION_PENDING  33
+#define SYNC_ERROR_ID_TOO_MANY_FILES            34
+#define SYNC_ERROR_ID_CHECKOUT_FILE             35
+#define SYNC_ERROR_ID_BLOCK_MISSING             36
+#define SYNC_ERROR_ID_CASE_CONFLICT             37
+#define SYNC_ERROR_ID_STOPPED_BY_LOGOUT         38
+#define SYNC_ERROR_ID_CORRUPTED_ENC_KEY         39
+#define SYNC_ERROR_ID_WATCH_FAILED              40
+#define N_SYNC_ERROR_ID                         41
 
 #endif

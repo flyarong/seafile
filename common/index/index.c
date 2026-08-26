@@ -961,7 +961,8 @@ int add_to_index(const char *repo_id,
                  SeafileCrypt *crypt,
                  IndexCB index_cb,
                  const char *modifier,
-                 gboolean *added)
+                 gboolean *added,
+                 gboolean *record_index_error)
 {
     int size, namelen;
     mode_t st_mode = st->st_mode;
@@ -1038,7 +1039,7 @@ int add_to_index(const char *repo_id,
 #endif
 #endif  /* 0 */
 
-    if (index_cb (repo_id, version, full_path, sha1, crypt, TRUE) < 0) {
+    if (index_cb (repo_id, version, full_path, sha1, crypt, TRUE, record_index_error) < 0) {
         free (ce);
         return -1;
     }
@@ -1974,6 +1975,7 @@ int write_index(struct index_state *istate, int newfd)
     struct cache_entry **cache = istate->cache;
     int entries = istate->cache_nr;
     SeafStat st;
+    const char *prev_name = NULL;
     int ret = 0;
 
     memset (&info, 0, sizeof(info));
@@ -2005,6 +2007,11 @@ int write_index(struct index_state *istate, int newfd)
         struct cache_entry *ce = cache[i];
         if (ce->ce_flags & CE_REMOVE)
             continue;
+        // skip duplicate cache.
+        if (prev_name && g_strcmp0 (ce->name, prev_name) ==0) {
+            continue;
+        }
+        prev_name = ce->name;
         /* if (!ce_uptodate(ce) && is_racy_timestamp(istate, ce)) */
         /*     ce_smudge_racily_clean_entry(ce); */
         if (ce_write_entry2(&info, newfd, ce) < 0) {

@@ -57,6 +57,7 @@ struct _HttpTxTask {
     char *host;
     gboolean is_clone;
     char *email;
+    char *username;
     gboolean use_fileserver_port;
 
     char head[41];
@@ -94,6 +95,20 @@ struct _HttpTxTask {
 };
 typedef struct _HttpTxTask HttpTxTask;
 
+HttpTxTask *
+http_tx_task_new (HttpTxManager *mgr,
+                  const char *repo_id,
+                  int repo_version,
+                  int type,
+                  gboolean is_clone,
+                  const char *host,
+                  const char *token,
+                  const char *passwd,
+                  const char *worktree);
+
+void
+http_tx_task_free (HttpTxTask *task);
+
 HttpTxManager *
 http_tx_manager_new (struct _SeafileSession *seaf);
 
@@ -112,6 +127,7 @@ http_tx_manager_add_download (HttpTxManager *manager,
                               const char *worktree,
                               int protocol_version,
                               const char *email,
+                              const char *username,
                               gboolean use_fileserver_port,
                               const char *repo_name,
                               GError **error);
@@ -146,6 +162,17 @@ http_tx_manager_check_protocol_version (HttpTxManager *manager,
                                         gboolean use_fileserver_port,
                                         HttpProtocolVersionCallback callback,
                                         void *user_data);
+
+
+typedef void (*HttpNotifServerCallback) (gboolean is_alive,
+                                         void *user_data);
+
+int
+http_tx_manager_check_notif_server (HttpTxManager *manager,
+                                    const char *host,
+                                    gboolean use_fileserver_port,
+                                    HttpNotifServerCallback callback,
+                                    void *user_data);
 
 struct _HttpHeadCommit {
     gboolean check_success;
@@ -260,14 +287,60 @@ http_tx_manager_unlock_file (HttpTxManager *manager,
                              const char *repo_id,
                              const char *path);
 
+struct _HttpAPIGetResult {
+    gboolean success;
+    char *rsp_content;
+    int rsp_size;
+    int error_code;
+    int http_status;
+};
+typedef struct _HttpAPIGetResult HttpAPIGetResult;
+
+typedef void (*HttpAPIGetCallback) (HttpAPIGetResult *result,
+                                    void *user_data);
+
+int
+http_tx_manager_fileserver_api_get  (HttpTxManager *manager,
+                                     const char *host,
+                                     const char *url,
+                                     const char *token,
+                                     HttpAPIGetCallback callback,
+                                     void *user_data);
+
 GHashTable *
 http_tx_manager_get_head_commit_ids (HttpTxManager *manager,
                                      const char *host,
                                      gboolean use_fileserver_port,
-                                     GList *repo_id_list);
+                                     GList *repo_id_list,
+                                     int *ret_status);
 
+/*
 int
 http_tx_task_download_file_blocks (HttpTxTask *task, const char *file_id);
+*/
+
+typedef size_t (*HttpRecvCallback) (void *, size_t, size_t, void *);
+
+int
+http_tx_manager_get_block (HttpTxManager *manager,
+                           const char *repo_id,
+                           const char *block_id,
+                           const char *host,
+                           const char *token,
+                           gboolean use_fileserver_port,
+                           int *error_id,
+                           HttpRecvCallback get_blk_cb,
+                           void *user_data);
+
+int
+http_tx_manager_get_file_block_map (HttpTxManager *manager,
+                                    const char *repo_id,
+                                    const char *file_id,
+                                    const char *host,
+                                    const char *token,
+                                    gboolean use_fileserver_port,
+                                    gint64 **pblock_map,
+                                    int *n_blocks);
 
 GList*
 http_tx_manager_get_upload_tasks (HttpTxManager *manager);

@@ -20,7 +20,7 @@ struct _SeafCommit {
     char        repo_id[37];
     char        root_id[41];    /* the fs root */
     char       *desc;
-    char       *creator_name;
+    char       *creator_name; // creator_name is user's email.
     char        creator_id[41];
     guint64     ctime;          /* creation time */
     char       *parent_id;
@@ -36,6 +36,9 @@ struct _SeafCommit {
     char       *magic;
     char       *random_key;
     char       *salt;
+    char       *pwd_hash;
+    char       *pwd_hash_algo;
+    char       *pwd_hash_params;
     gboolean    no_local_history;
 
     int         version;

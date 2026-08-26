@@ -11,10 +11,12 @@
 #include <windows.h>
 #endif
 
+#ifndef WIN32
 #include <sys/time.h>
+#include <unistd.h>
+#endif
 #include <time.h>
 #include <stdint.h>
-#include <unistd.h>
 #include <stdarg.h>
 #include <glib.h>
 #include <glib-object.h>
@@ -39,6 +41,10 @@
 #include <errno.h>
 #include <glib/gstdio.h>
 
+#define mode_t int
+
+#define ssize_t gssize
+
 #ifndef WEXITSTATUS
 #define WEXITSTATUS(status) (((status) & 0xff00) >> 8)
 #endif
@@ -49,6 +55,26 @@
 
 #define SeafStat struct stat
 
+#endif
+
+#ifndef SEAFILE_CLIENT_VERSION
+#define SEAFILE_CLIENT_VERSION PACKAGE_VERSION
+#endif
+
+#ifdef WIN32
+#define USER_AGENT_OS "Windows NT"
+#endif
+
+#ifdef __APPLE__
+#define USER_AGENT_OS "Apple OS X"
+#endif
+
+#ifdef __linux__
+#define USER_AGENT_OS "Linux"
+#endif
+
+#if defined __FreeBSD__ || defined __NetBSD__ || defined __OpenBSD__ || defined __DragonFly__
+#define USER_AGENT_OS "BSD"
 #endif
 
 int seaf_stat (const char *path, SeafStat *st);
@@ -142,15 +168,27 @@ should_ignore_on_checkout (const char *file_path, IgnoreReason *ignore_reason);
 
 /* for debug */
 #ifndef ccnet_warning
+#ifndef WIN32
 #define ccnet_warning(fmt, ...) g_warning("%s(%d): " fmt, __FILE__, __LINE__, ##__VA_ARGS__)
+#else
+#define ccnet_warning(...) g_warning (__VA_ARGS__)
+#endif
 #endif
 
 #ifndef ccnet_error
+#ifndef WIN32
 #define ccnet_error(fmt, ...)   g_error("%s(%d): " fmt, __FILE__, __LINE__, ##__VA_ARGS__)
+#else
+#define ccnet_error(...) g_error(__VA_ARGS__)
+#endif
 #endif
 
 #ifndef ccnet_message
+#ifndef WIN32
 #define ccnet_message(fmt, ...) g_message("%s(%d): " fmt, __FILE__, __LINE__, ##__VA_ARGS__)
+#else
+#define ccnet_message(...) g_message(__VA_ARGS__)
+#endif
 #endif
 
 #define CCNET_DOMAIN g_quark_from_string("ccnet")
@@ -398,4 +436,16 @@ is_eml_file (const char *path);
 
 char *
 canonical_server_url (const char *url_in);
+
+gboolean
+is_path_case_conflict (const char *full_path, const char *path, char **conflict_path, GHashTable *no_case_conflict_hash);
+
+ssize_t
+seaf_getxattr (const char *path, const char *name, void *value, size_t size);
+
+int
+seaf_setxattr (const char *path, const char *name, const void *value, size_t size);
+
+int
+seaf_removexattr (const char *path, const char *name);
 #endif

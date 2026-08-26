@@ -15,6 +15,12 @@ AM_CFLAGS = -DPKGDATADIR=\"$(pkgdatadir)\" \
 	@GNUTLS_CFLAGS@ \
 	-Wall
 
+if MACOS
+if COMPILE_UNIVERSAL
+AM_CFLAGS += -arch x86_64 -arch arm64
+endif
+endif
+
 bin_PROGRAMS = seaf-daemon
 
 noinst_HEADERS = \
@@ -33,7 +39,8 @@ noinst_HEADERS = \
 	filelock-mgr.h \
 	set-perm.h \
 	change-set.h \
-	seafile-error-impl.h
+	seafile-error-impl.h \
+	notif-mgr.h
 
 if LINUX
 wt_monitor_src = wt-monitor.c wt-monitor-linux.c wt-monitor-structs.c
@@ -45,6 +52,14 @@ endif
 
 if MACOS
 wt_monitor_src = wt-monitor.c wt-monitor-macos.c wt-monitor-structs.c
+endif
+
+if MACOS
+ws_src = notif-mgr.c
+else
+if COMPILE_LINUX_WS
+ws_src = notif-mgr.c
+endif
 endif
 
 common_src = \
@@ -68,10 +83,12 @@ common_src = \
 	../common/block-backend-fs.c \
 	../common/mq-mgr.c \
 	../common/curl-init.c \
+	../common/password-hash.c \
 	sync-status-tree.c \
 	filelock-mgr.c \
 	set-perm.c \
-	change-set.c
+	change-set.c \
+	$(ws_src)
 
 
 seaf_daemon_SOURCES = seaf-daemon.c $(common_src)
@@ -81,6 +98,7 @@ seaf_daemon_LDADD = $(top_builddir)/lib/libseafile_common.la \
 	@LIB_RT@ @LIB_UUID@ -lsqlite3 @LIBEVENT_LIBS@ @LIBEVENT_PTHREADS_LIBS@\
 	$(top_builddir)/common/cdc/libcdc.la \
 	$(top_builddir)/common/index/libindex.la @LIB_WS32@ @LIB_CRYPT32@ \
-	@SEARPC_LIBS@ @JANSSON_LIBS@ @LIB_MAC@ @ZLIB_LIBS@ @CURL_LIBS@ @BPWRAPPER_LIBS@
+	@SEARPC_LIBS@ @JANSSON_LIBS@ @LIB_MAC@ @ZLIB_LIBS@ @CURL_LIBS@ @BPWRAPPER_LIBS@ \
+	@WS_LIBS@ @ARGON2_LIBS@
 
 seaf_daemon_LDFLAGS = @CONSOLE@

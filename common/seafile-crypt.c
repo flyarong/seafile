@@ -5,6 +5,7 @@
 #include <string.h>
 #include <glib.h>
 #include "seafile-crypt.h"
+#include "password-hash.h"
 
 #ifdef USE_GPL_CRYPTO
 #include <gnutls/gnutls.h>
@@ -52,14 +53,32 @@ seafile_derive_key (const char *data_in, int in_len, int version,
                     unsigned char *key, unsigned char *iv)
 {
 #ifdef USE_GPL_CRYPTO
-    if (version != 2) {
+    unsigned char repo_salt_bin[32];
+
+    if (version == 4)
+        hex_to_rawdata (repo_salt, repo_salt_bin, 32);
+
+    switch (version) {
+    case 1:
+        seaf_warning ("Encrypted library version %d is not supported.\n", version);
+        return -1;
+    case 2:
+        pbkdf2_hmac_sha256 (in_len, (const guchar *)data_in, KEYGEN_ITERATION2,
+                            sizeof(salt), salt, 32, key);
+        pbkdf2_hmac_sha256 (32, (const guchar *)key, 10, sizeof(salt), salt, 16, iv);
+        break;
+    case 3:
+        seaf_warning ("Encrypted library version %d is not supported.\n", version);
+        return -1;
+    case 4:
+        pbkdf2_hmac_sha256 (in_len, (const guchar *)data_in, KEYGEN_ITERATION2,
+                            sizeof(repo_salt_bin), repo_salt_bin, 32, key);
+        pbkdf2_hmac_sha256 (32, (const guchar *)key, 10, sizeof(repo_salt_bin), repo_salt_bin, 16, iv);
+        break;
+    default:
         seaf_warning ("Encrypted library version %d is not supported.\n", version);
         return -1;
     }
-
-    pbkdf2_hmac_sha256 (in_len, (const guchar *)data_in, KEYGEN_ITERATION2,
-                        sizeof(salt), salt, 32, key);
-    pbkdf2_hmac_sha256 (32, (const guchar *)key, 10, sizeof(salt), salt, 16, iv);
 
     return 0;
 #else
@@ -122,13 +141,17 @@ seafile_generate_repo_salt (char *repo_salt)
 
 #ifdef USE_GPL_CRYPTO
     int rc = gnutls_rnd (GNUTLS_RND_RANDOM, repo_salt_bin, sizeof(repo_salt_bin));
+    if (rc != 0) {
+        seaf_warning ("Failed to generate salt for repo encryption.\n");
+        return -1;
+    }
 #else
     int rc = RAND_bytes (repo_salt_bin, sizeof(repo_salt_bin));
-#endif
     if (rc != 1) {
         seaf_warning ("Failed to generate salt for repo encryption.\n");
         return -1;
     }
+#endif
 
     rawdata_to_hex (repo_salt_bin, repo_salt, 32);
 
@@ -194,6 +217,37 @@ seafile_generate_magic (int version, const char *repo_id,
     rawdata_to_hex (key, magic, 32);
 }
 
+void
+seafile_generate_pwd_hash (int version,
+                           const char *repo_id,
+                           const char *passwd,
+                           const char *repo_salt,
+                           const char *algo,
+                           const char *params_str,
+                           char *pwd_hash)
+{
+    GString *buf = g_string_new (NULL);
+    unsigned char key[32];
+
+    /* Compute a "pwd_hash" string from repo_id and passwd.
+    * This is used to verify the password given by user before decrypting
+    * data.
+    */
+    g_string_append_printf (buf, "%s%s", repo_id, passwd);
+
+    if (version <= 2) {
+        // use fixed repo salt
+        char fixed_salt[64] = {0};
+        rawdata_to_hex(salt, fixed_salt, 8);
+        pwd_hash_derive_key (buf->str, buf->len, fixed_salt, algo, params_str, key);
+    } else {
+        pwd_hash_derive_key (buf->str, buf->len, repo_salt, algo, params_str, key);
+    }
+
+    g_string_free (buf, TRUE);
+    rawdata_to_hex (key, pwd_hash, 32);
+}
+
 int
 seafile_verify_repo_passwd (const char *repo_id,
                             const char *passwd,
@@ -223,6 +277,39 @@ seafile_verify_repo_passwd (const char *repo_id,
         rawdata_to_hex (key, hex, 16);
 
     if (g_strcmp0 (hex, magic) == 0)
+        return 0;
+    else
+        return -1;
+}
+
+int
+seafile_pwd_hash_verify_repo_passwd (int version,
+                                     const char *repo_id,
+                                     const char *passwd,
+                                     const char *repo_salt,
+                                     const char *pwd_hash,
+                                     const char *algo,
+                                     const char *params_str)
+{
+    GString *buf = g_string_new (NULL);
+    unsigned char key[32];
+    char hex[65];
+
+    g_string_append_printf (buf, "%s%s", repo_id, passwd);
+
+    if (version <= 2) {
+        // use fixed repo salt
+        char fixed_salt[64] = {0};
+        rawdata_to_hex(salt, fixed_salt, 8);
+        pwd_hash_derive_key (buf->str, buf->len, fixed_salt, algo, params_str, key);
+    } else {
+        pwd_hash_derive_key (buf->str, buf->len, repo_salt, algo, params_str, key);
+    }
+
+    g_string_free (buf, TRUE);
+    rawdata_to_hex (key, hex, 32);
+    
+    if (g_strcmp0 (hex, pwd_hash) == 0)
         return 0;
     else
         return -1;
@@ -348,11 +435,18 @@ seafile_encrypt (char **data_out,
     key.size = sizeof(crypt->key);
     iv.data = crypt->iv;
     iv.size = sizeof(crypt->iv);
-    rc = gnutls_cipher_init (&handle, GNUTLS_CIPHER_AES_256_CBC, &key, &iv);
-    if (rc < 0) {
-        seaf_warning ("Failed to init cipher: %s\n", gnutls_strerror(rc));
+
+    if (crypt->version == 1 || crypt->version == 3) {
+        seaf_warning ("Encrypted library version % is not supported.\n", crypt->version);
         ret = -1;
         goto out;
+    } else {
+        rc = gnutls_cipher_init (&handle, GNUTLS_CIPHER_AES_256_CBC, &key, &iv);
+        if (rc < 0) {
+            seaf_warning ("Failed to init cipher: %s\n", gnutls_strerror(rc));
+            ret = -1;
+            goto out;
+        }
     }
 
     enc_buf = g_new (char, buf_size);
@@ -402,11 +496,18 @@ seafile_decrypt (char **data_out,
     key.size = sizeof(crypt->key);
     iv.data = crypt->iv;
     iv.size = sizeof(crypt->iv);
-    rc = gnutls_cipher_init (&handle, GNUTLS_CIPHER_AES_256_CBC, &key, &iv);
-    if (rc < 0) {
-        seaf_warning ("Failed to init cipher: %s\n", gnutls_strerror(rc));
+
+    if (crypt->version == 1 || crypt->version == 3) {
+        seaf_warning ("Encrypted library version %d is not supported.\n", crypt->version);
         ret = -1;
         goto out;
+    } else {
+        rc = gnutls_cipher_init (&handle, GNUTLS_CIPHER_AES_256_CBC, &key, &iv);
+        if (rc < 0) {
+            seaf_warning ("Failed to init cipher: %s\n", gnutls_strerror(rc));
+            ret = -1;
+            goto out;
+        }
     }
 
     dec_buf = g_new (char, in_len);

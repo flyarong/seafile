@@ -27,8 +27,6 @@ typedef struct _LockInfo {
  * - Locked by the user manually
  * - Auto-Locked by Seafile when it detects Office opens the file.
  */
-#define _LOCKED_MANUAL 1
-#define _LOCKED_AUTO 2
 
 struct _SeafFilelockManager *
 seaf_filelock_manager_new (struct _SeafileSession *session)
@@ -95,15 +93,15 @@ seaf_filelock_manager_init (SeafFilelockManager *mgr)
 
     sql = "CREATE TABLE IF NOT EXISTS ServerLockedFiles ("
         "repo_id TEXT, path TEXT, locked_by_me INTEGER);";
-    sqlite_query_exec (db, sql);
+    sqlite_query_exec (db, sql, 0);
 
     sql = "CREATE INDEX IF NOT EXISTS server_locked_files_repo_id_idx "
         "ON ServerLockedFiles (repo_id);";
-    sqlite_query_exec (db, sql);
+    sqlite_query_exec (db, sql, 0);
 
     sql = "CREATE TABLE IF NOT EXISTS ServerLockedFilesTimestamp ("
         "repo_id TEXT, timestamp INTEGER, PRIMARY KEY (repo_id));";
-    sqlite_query_exec (db, sql);
+    sqlite_query_exec (db, sql, 0);
 
     sql = "SELECT repo_id, path, locked_by_me FROM ServerLockedFiles";
 
@@ -112,9 +110,10 @@ seaf_filelock_manager_init (SeafFilelockManager *mgr)
 
     if (sqlite_foreach_selected_row (mgr->priv->db, sql,
                                      load_locked_files,
-                                     mgr->priv->repo_locked_files) < 0) {
-        pthread_mutex_unlock (&mgr->priv->db_lock);
+                                     mgr->priv->repo_locked_files,
+                                     0) < 0) {
         pthread_mutex_unlock (&mgr->priv->hash_lock);
+        pthread_mutex_unlock (&mgr->priv->db_lock);
         g_hash_table_destroy (mgr->priv->repo_locked_files);
         return -1;
     }
@@ -234,9 +233,9 @@ seaf_filelock_manager_get_lock_status (SeafFilelockManager *mgr,
         return FILE_NOT_LOCKED;
     }
 
-    if (info->locked_by_me == _LOCKED_MANUAL)
+    if (info->locked_by_me == LOCKED_MANUAL)
         ret = FILE_LOCKED_BY_ME_MANUAL;
-    else if (info->locked_by_me == _LOCKED_AUTO)
+    else if (info->locked_by_me == LOCKED_AUTO)
         ret = FILE_LOCKED_BY_ME_AUTO;
     else
         ret = FILE_LOCKED_BY_OTHERS;
@@ -315,6 +314,7 @@ update_in_memory (SeafFilelockManager *mgr, const char *repo_id, GHashTable *new
     repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
     if (!repo) {
         seaf_warning ("Failed to find repo %s\n", repo_id);
+        pthread_mutex_unlock (&mgr->priv->hash_lock);
         return;
     }
 
@@ -408,8 +408,10 @@ update_db (SeafFilelockManager *mgr, const char *repo_id)
     }
     sqlite3_finalize (stmt);
 
+    pthread_mutex_lock (&mgr->priv->hash_lock);
     locks = g_hash_table_lookup (mgr->priv->repo_locked_files, repo_id);
     if (!locks || g_hash_table_size (locks) == 0) {
+        pthread_mutex_unlock (&mgr->priv->hash_lock);
         pthread_mutex_unlock (&mgr->priv->db_lock);
         return 0;
     }
@@ -423,6 +425,10 @@ update_db (SeafFilelockManager *mgr, const char *repo_id)
     for (ptr = paths; ptr; ptr = ptr->next) {
         path = ptr->data;
         info = g_hash_table_lookup (locks, path);
+        if (!info) {
+            seaf_warning ("BUG: empty lock info for path %s.\n", path);
+            continue;
+        }
 
         sqlite3_bind_text (stmt, 1, repo_id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text (stmt, 2, path, -1, SQLITE_TRANSIENT);
@@ -432,6 +438,7 @@ update_db (SeafFilelockManager *mgr, const char *repo_id)
             seaf_warning ("Failed to insert server file lock for %.8s: %s.\n",
                           repo_id, sqlite3_errmsg (mgr->priv->db));
             sqlite3_finalize (stmt);
+            pthread_mutex_unlock (&mgr->priv->hash_lock);
             pthread_mutex_unlock (&mgr->priv->db_lock);
             return -1;
         }
@@ -443,6 +450,7 @@ update_db (SeafFilelockManager *mgr, const char *repo_id)
     sqlite3_finalize (stmt);
     g_list_free (paths);
 
+    pthread_mutex_unlock (&mgr->priv->hash_lock);
     pthread_mutex_unlock (&mgr->priv->db_lock);
 
     return 0;
@@ -465,36 +473,40 @@ seaf_filelock_manager_update_timestamp (SeafFilelockManager *mgr,
                                         const char *repo_id,
                                         gint64 timestamp)
 {
-    char sql[256];
     int ret;
-
-    snprintf (sql, sizeof(sql),
-              "REPLACE INTO ServerLockedFilesTimestamp VALUES ('%s', %"G_GINT64_FORMAT")",
-              repo_id, timestamp);
 
     pthread_mutex_lock (&mgr->priv->db_lock);
 
-    ret = sqlite_query_exec (mgr->priv->db, sql);
+    ret = sqlite_query_exec (mgr->priv->db,
+                             "REPLACE INTO ServerLockedFilesTimestamp VALUES (?, ?)",
+                             2, "string", repo_id, "int64", timestamp);
 
     pthread_mutex_unlock (&mgr->priv->db_lock);
 
     return ret;
 }
 
+static gboolean
+get_locked_files_timestamp (sqlite3_stmt *stmt, void *data)
+{
+    gint64 *timestamp = data;
+
+    *timestamp = sqlite3_column_int64 (stmt, 0);
+    return FALSE;
+}
+
 gint64
 seaf_filelock_manager_get_timestamp (SeafFilelockManager *mgr,
                                      const char *repo_id)
 {
-    char sql[256];
-    gint64 ret;
-
-    sqlite3_snprintf (sizeof(sql), sql,
-                      "SELECT timestamp FROM ServerLockedFilesTimestamp WHERE repo_id = '%q'",
-                      repo_id);
+    gint64 ret = -1;
 
     pthread_mutex_lock (&mgr->priv->db_lock);
 
-    ret = sqlite_get_int64 (mgr->priv->db, sql);
+    sqlite_foreach_selected_row (mgr->priv->db,
+                                 "SELECT timestamp FROM ServerLockedFilesTimestamp WHERE repo_id = ?",
+                                 get_locked_files_timestamp, &ret,
+                                 1, "string", repo_id);
 
     pthread_mutex_unlock (&mgr->priv->db_lock);
 
@@ -593,7 +605,7 @@ int
 seaf_filelock_manager_mark_file_locked (SeafFilelockManager *mgr,
                                         const char *repo_id,
                                         const char *path,
-                                        gboolean is_auto_lock)
+                                        FileLockType type)
 {
     GHashTable *locks;
     LockInfo *info;
@@ -614,10 +626,7 @@ seaf_filelock_manager_mark_file_locked (SeafFilelockManager *mgr,
         g_hash_table_insert (locks, g_strdup(path), info);
     }
 
-    if (!is_auto_lock)
-        info->locked_by_me = _LOCKED_MANUAL;
-    else
-        info->locked_by_me = _LOCKED_AUTO;
+    info->locked_by_me = type;
 
     pthread_mutex_unlock (&mgr->priv->hash_lock);
 
@@ -712,21 +721,57 @@ collect_auto_locked_files (sqlite3_stmt *stmt, void *vret)
 GList *
 seaf_filelock_manager_get_auto_locked_files (SeafFilelockManager *mgr)
 {
-    char *sql;
     GList *ret = NULL;
 
     pthread_mutex_lock (&mgr->priv->db_lock);
 
-    sql = sqlite3_mprintf ("SELECT repo_id, path FROM ServerLockedFiles "
-                           "WHERE locked_by_me = %d", _LOCKED_AUTO);
-    sqlite_foreach_selected_row (mgr->priv->db, sql,
+    sqlite_foreach_selected_row (mgr->priv->db,
+                                 "SELECT repo_id, path FROM ServerLockedFiles "
+                                 "WHERE locked_by_me = ?",
                                  collect_auto_locked_files,
-                                 &ret);
+                                 &ret,
+                                 1, "int", LOCKED_AUTO);
 
     pthread_mutex_unlock (&mgr->priv->db_lock);
 
     ret = g_list_reverse (ret);
 
-    sqlite3_free (sql);
     return ret;
+}
+
+int
+seaf_filelock_manager_lock_file (SeafFilelockManager *mgr,
+                                 const char *repo_id,
+                                 const char *path,
+                                 FileLockType type)
+{
+    int ret = -1;
+
+    ret = seaf_filelock_manager_mark_file_locked (seaf->filelock_mgr, repo_id, path, type);
+    if (ret < 0) {
+        return ret;
+    }
+
+    if (!type) {
+        seaf_filelock_manager_lock_wt_file (mgr, repo_id, path);
+    }
+
+    return 0;
+}
+
+int
+seaf_filelock_manager_unlock_file (SeafFilelockManager *mgr,
+                                   const char *repo_id,
+                                   const char *path)
+{
+    int ret = -1;
+
+    ret = seaf_filelock_manager_mark_file_unlocked (mgr, repo_id, path);
+    if (ret < 0) {
+        return ret;
+    }
+
+    seaf_filelock_manager_unlock_wt_file (mgr, repo_id, path);
+
+    return 0;
 }

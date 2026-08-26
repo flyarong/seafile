@@ -164,6 +164,56 @@ static SyncErrorInfo sync_error_info_tbl[] = {
         SYNC_ERROR_LEVEL_FILE,
         "A folder that may contain not-yet-uploaded files is moved to seafile-recycle-bin folder"
     },
+    {
+        SYNC_ERROR_ID_INVALID_PATH_ON_WINDOWS,
+        SYNC_ERROR_LEVEL_FILE,
+        "File or directory is invalid on Windows"
+    },
+    {
+        SYNC_ERROR_ID_LIBRARY_TOO_LARGE,
+        SYNC_ERROR_LEVEL_REPO,
+        "Library cannot be synced since it has too many files"
+    },
+    {
+        SYNC_ERROR_ID_DEL_CONFIRMATION_PENDING,
+        SYNC_ERROR_LEVEL_REPO,
+        "Waiting for confirmation to delete files"
+    },
+    {
+        SYNC_ERROR_ID_TOO_MANY_FILES,
+        SYNC_ERROR_LEVEL_REPO,
+        "Files cannot be uploaded to this library due to file number limit settings"
+    },
+    {
+        SYNC_ERROR_ID_CHECKOUT_FILE,
+        SYNC_ERROR_LEVEL_FILE,
+        "Failed to checkout file on the client. Please check disk space or folder permissions"
+    },
+    {
+        SYNC_ERROR_ID_BLOCK_MISSING,
+        SYNC_ERROR_LEVEL_REPO,
+        "Failed to upload file blocks. Please check network or firewall"
+    },
+    {
+        SYNC_ERROR_ID_CASE_CONFLICT,
+        SYNC_ERROR_LEVEL_FILE,
+        "Path has character case conflict with existing file or folder. Will not be downloaded"
+    },
+    {
+        SYNC_ERROR_ID_STOPPED_BY_LOGOUT,
+        SYNC_ERROR_LEVEL_REPO,
+        "Syncing is stopped by logout. Please re-sync the library if needed"
+    },
+    {
+        SYNC_ERROR_ID_CORRUPTED_ENC_KEY,
+        SYNC_ERROR_LEVEL_REPO,
+        "Encryption key is corrupted. Please create a new library and upload files again"
+    },
+    {
+        SYNC_ERROR_ID_WATCH_FAILED,
+        SYNC_ERROR_LEVEL_FILE,
+        "Failed to monitor local folder changes. Please check Linux inotify limits or ignore rules"
+    },
 };
 
 const char *

@@ -39,6 +39,7 @@ struct _CloneTask {
     char                *peer_port; 
     char                *token;
     char                *email;
+    char                *username;
     char                *repo_name; /* For better display. */
     char                *tx_id;
     char                *worktree;
@@ -46,6 +47,7 @@ struct _CloneTask {
     int                  enc_version;
     char                *repo_salt;
     char                *random_key;
+    gboolean            resync_enc_repo;
     char                 root_id[41];
     gboolean             is_readonly;
     /* Set to true when the local folder name is the same as library name.

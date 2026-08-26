@@ -68,12 +68,20 @@ mark_clone_done_v2 (SeafRepo *repo, CloneTask *task)
     seaf_branch_unref (local);
 
     if (repo->encrypted) {
-        if (seaf_repo_manager_set_repo_passwd (seaf->repo_mgr,
-                                               repo,
-                                               task->passwd) < 0) {
-            seaf_warning ("[Clone mgr] failed to set passwd for %s.\n", repo->id);
-            transition_to_error (task, SYNC_ERROR_ID_GENERAL_ERROR);
-            return;
+        if (!task->resync_enc_repo) {
+            if (seaf_repo_manager_set_repo_passwd (seaf->repo_mgr,
+                                                   repo,
+                                                   task->passwd) < 0) {
+                seaf_warning ("[Clone mgr] failed to set passwd for %s.\n", repo->id);
+                transition_to_error (task, SYNC_ERROR_ID_GENERAL_ERROR);
+                return;
+            }
+        } else {
+            if (seaf_repo_manager_load_repo_enc_info (seaf->repo_mgr, repo) < 0) {
+                seaf_warning ("[Clone mgr] failed to set enc info for %s.\n", repo->id);
+                transition_to_error (task, SYNC_ERROR_ID_GENERAL_ERROR);
+                return;
+            }
         }
     }
 
@@ -121,7 +129,7 @@ start_clone_v2 (CloneTask *task)
     GError *error = NULL;
 
     if (g_access (task->worktree, F_OK) != 0 &&
-        g_mkdir_with_parents (task->worktree, 0777) < 0) {
+        checkdir_with_mkdir (task->worktree) < 0) {
         seaf_warning ("[clone mgr] Failed to create worktree %s.\n",
                       task->worktree);
         transition_to_error (task, SYNC_ERROR_ID_WRITE_LOCAL_DATA);
@@ -139,6 +147,12 @@ start_clone_v2 (CloneTask *task)
                                                  repo->id,
                                                  REPO_PROP_SERVER_URL,
                                                  task->server_url);
+        }
+        if (task->username) {
+            seaf_repo_manager_set_repo_property (seaf->repo_mgr,
+                                                 repo->id,
+                                                 REPO_PROP_USERNAME,
+                                                 task->username);
         }
 
         mark_clone_done_v2 (repo, task);
@@ -310,6 +324,7 @@ clone_task_free (CloneTask *task)
     g_free (task->peer_addr);
     g_free (task->peer_port);
     g_free (task->email);
+    g_free (task->username);
     g_free (task->random_key);
     g_free (task->server_url);
     g_free (task->effective_url);
@@ -363,14 +378,11 @@ load_enc_info_cb (sqlite3_stmt *stmt, void *data)
 static int
 load_clone_enc_info (CloneTask *task)
 {
-    char sql[256];
-
-    snprintf (sql, sizeof(sql),
-              "SELECT enc_version, random_key FROM CloneEncInfo WHERE repo_id='%s'",
-              task->repo_id);
-
-    if (sqlite_foreach_selected_row (task->manager->db, sql,
-                                     load_enc_info_cb, task) < 0)
+    if (sqlite_foreach_selected_row (task->manager->db,
+                                     "SELECT enc_version, random_key "
+                                     "FROM CloneEncInfo WHERE repo_id=?",
+                                     load_enc_info_cb, task,
+                                     1, "string", task->repo_id) < 0)
         return -1;
 
     return 0;
@@ -392,14 +404,10 @@ load_version_info_cb (sqlite3_stmt *stmt, void *data)
 static void
 load_clone_repo_version_info (CloneTask *task)
 {
-    char sql[256];
-
-    snprintf (sql, sizeof(sql),
-              "SELECT repo_version FROM CloneVersionInfo WHERE repo_id='%s'",
-              task->repo_id);
-
-    sqlite_foreach_selected_row (task->manager->db, sql,
-                                 load_version_info_cb, task);
+    sqlite_foreach_selected_row (task->manager->db,
+                                 "SELECT repo_version FROM CloneVersionInfo WHERE repo_id=?",
+                                 load_version_info_cb, task,
+                                 1, "string", task->repo_id);
 }
 
 static gboolean
@@ -425,6 +433,9 @@ load_more_info_cb (sqlite3_stmt *stmt, void *data)
     json_t *repo_salt = json_object_get (object, "repo_salt");
     if (repo_salt)
         task->repo_salt = g_strdup (json_string_value (repo_salt));
+    json_t *username = json_object_get (object, "username");
+    if (username)
+        task->username = g_strdup (json_string_value (username));
     json_decref (object);
 
     return FALSE;
@@ -433,14 +444,10 @@ load_more_info_cb (sqlite3_stmt *stmt, void *data)
 static void
 load_clone_more_info (CloneTask *task)
 {
-    char sql[256];
-
-    snprintf (sql, sizeof(sql),
-              "SELECT more_info FROM CloneTasksMoreInfo WHERE repo_id='%s'",
-              task->repo_id);
-
-    sqlite_foreach_selected_row (task->manager->db, sql,
-                                 load_more_info_cb, task);
+    sqlite_foreach_selected_row (task->manager->db,
+                                 "SELECT more_info FROM CloneTasksMoreInfo WHERE repo_id=?",
+                                 load_more_info_cb, task,
+                                 1, "string", task->repo_id);
 }
 
 static gboolean
@@ -506,27 +513,27 @@ seaf_clone_manager_init (SeafCloneManager *mgr)
         "token TEXT, dest_id TEXT,"
         "worktree_parent TEXT, passwd TEXT, "
         "server_addr TEXT, server_port TEXT, email TEXT);";
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db, sql, 0) < 0)
         return -1;
 
     sql = "CREATE TABLE IF NOT EXISTS CloneTasksMoreInfo "
         "(repo_id TEXT PRIMARY KEY, more_info TEXT);";
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db, sql, 0) < 0)
         return -1;
 
     sql = "CREATE TABLE IF NOT EXISTS CloneEncInfo "
         "(repo_id TEXT PRIMARY KEY, enc_version INTEGER, random_key TEXT);";
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db, sql, 0) < 0)
         return -1;
 
     sql = "CREATE TABLE IF NOT EXISTS CloneVersionInfo "
         "(repo_id TEXT PRIMARY KEY, repo_version INTEGER);";
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db, sql, 0) < 0)
         return -1;
 
     sql = "CREATE TABLE IF NOT EXISTS CloneServerURL "
         "(repo_id TEXT PRIMARY KEY, server_url TEXT);";
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db, sql, 0) < 0)
         return -1;
 
     return 0;
@@ -560,7 +567,7 @@ seaf_clone_manager_start (SeafCloneManager *mgr)
                                        CHECK_CONNECT_INTERVAL * 1000);
 
     char *sql = "SELECT * FROM CloneTasks";
-    if (sqlite_foreach_selected_row (mgr->db, sql, restart_task, mgr) < 0)
+    if (sqlite_foreach_selected_row (mgr->db, sql, restart_task, mgr, 0) < 0)
         return -1;
 
     g_signal_connect (seaf, "repo-http-fetched",
@@ -572,49 +579,47 @@ seaf_clone_manager_start (SeafCloneManager *mgr)
 static int
 save_task_to_db (SeafCloneManager *mgr, CloneTask *task)
 {
-    char *sql;
-
-    if (task->passwd)
-        sql = sqlite3_mprintf ("REPLACE INTO CloneTasks VALUES "
-            "('%q', '%q', '%q', NULL, '%q', '%q', NULL, NULL, '%q')",
-                                task->repo_id, task->repo_name,
-                                task->token,
-                                task->worktree, task->passwd,
-                                task->email);
-    else
-        sql = sqlite3_mprintf ("REPLACE INTO CloneTasks VALUES "
-            "('%q', '%q', '%q', NULL, '%q', NULL, NULL, NULL, '%q')",
-                                task->repo_id, task->repo_name,
-                                task->token,
-                                task->worktree, task->email);
-
-    if (sqlite_query_exec (mgr->db, sql) < 0) {
-        sqlite3_free (sql);
-        return -1;
+    if (task->passwd) {
+        if (sqlite_query_exec (mgr->db,
+                               "REPLACE INTO CloneTasks VALUES (?, ?, ?, NULL, ?, ?, NULL, NULL, ?)",
+                               6,
+                               "string", task->repo_id,
+                               "string", task->repo_name,
+                               "string", task->token,
+                               "string", task->worktree,
+                               "string", task->passwd,
+                               "string", task->email) < 0)
+            return -1;
+    } else {
+        if (sqlite_query_exec (mgr->db,
+                               "REPLACE INTO CloneTasks VALUES (?, ?, ?, NULL, ?, NULL, NULL, NULL, ?)",
+                               5,
+                               "string", task->repo_id,
+                               "string", task->repo_name,
+                               "string", task->token,
+                               "string", task->worktree,
+                               "string", task->email) < 0)
+            return -1;
     }
-    sqlite3_free (sql);
 
     if (task->passwd && task->enc_version >= 2 && task->random_key) {
-        sql = sqlite3_mprintf ("REPLACE INTO CloneEncInfo VALUES "
-                               "('%q', %d, '%q')",
-                               task->repo_id, task->enc_version, task->random_key);
-        if (sqlite_query_exec (mgr->db, sql) < 0) {
-            sqlite3_free (sql);
+        if (sqlite_query_exec (mgr->db,
+                               "REPLACE INTO CloneEncInfo VALUES (?, ?, ?)",
+                               3,
+                               "string", task->repo_id,
+                               "int", task->enc_version,
+                               "string", task->random_key) < 0)
             return -1;
-        }
-        sqlite3_free (sql);
     }
 
-    sql = sqlite3_mprintf ("REPLACE INTO CloneVersionInfo VALUES "
-                           "('%q', %d)",
-                           task->repo_id, task->repo_version);
-    if (sqlite_query_exec (mgr->db, sql) < 0) {
-        sqlite3_free (sql);
+    if (sqlite_query_exec (mgr->db,
+                           "REPLACE INTO CloneVersionInfo VALUES (?, ?)",
+                           2,
+                           "string", task->repo_id,
+                           "int", task->repo_version) < 0)
         return -1;
-    }
-    sqlite3_free (sql);
 
-    if (task->is_readonly || task->server_url || task->repo_salt) {
+    if (task->is_readonly || task->server_url || task->repo_salt || task->username) {
         /* need to store more info */
         json_t *object = NULL;
         gchar *info = NULL;
@@ -623,17 +628,21 @@ save_task_to_db (SeafCloneManager *mgr, CloneTask *task)
         json_object_set_new (object, "is_readonly", json_integer (task->is_readonly));
         if (task->server_url)
             json_object_set_new (object, "server_url", json_string(task->server_url));
-    
+        if (task->repo_salt)
+            json_object_set_new (object, "repo_salt", json_string(task->repo_salt));
+        if (task->username)
+            json_object_set_new (object, "username", json_string(task->username));
+        
         info = json_dumps (object, 0);
         json_decref (object);
-        sql = sqlite3_mprintf ("REPLACE INTO CloneTasksMoreInfo VALUES "
-                           "('%q', '%q')", task->repo_id, info);
-        if (sqlite_query_exec (mgr->db, sql) < 0) {
-            sqlite3_free (sql);
+        if (sqlite_query_exec (mgr->db,
+                               "REPLACE INTO CloneTasksMoreInfo VALUES (?, ?)",
+                               2,
+                               "string", task->repo_id,
+                               "string", info) < 0) {
             g_free (info);
             return -1;
         }
-        sqlite3_free (sql);
         g_free (info);
     }
 
@@ -643,30 +652,24 @@ save_task_to_db (SeafCloneManager *mgr, CloneTask *task)
 static int
 remove_task_from_db (SeafCloneManager *mgr, const char *repo_id)
 {
-    char sql[256];
-
-    snprintf (sql, sizeof(sql), 
-              "DELETE FROM CloneTasks WHERE repo_id='%s'",
-              repo_id);
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db,
+                           "DELETE FROM CloneTasks WHERE repo_id=?",
+                           1, "string", repo_id) < 0)
         return -1;
 
-    snprintf (sql, sizeof(sql), 
-              "DELETE FROM CloneEncInfo WHERE repo_id='%s'",
-              repo_id);
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db,
+                           "DELETE FROM CloneEncInfo WHERE repo_id=?",
+                           1, "string", repo_id) < 0)
         return -1;
 
-    snprintf (sql, sizeof(sql), 
-              "DELETE FROM CloneVersionInfo WHERE repo_id='%s'",
-              repo_id);
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db,
+                           "DELETE FROM CloneVersionInfo WHERE repo_id=?",
+                           1, "string", repo_id) < 0)
         return -1;
 
-    snprintf (sql, sizeof(sql), 
-              "DELETE FROM CloneTasksMoreInfo WHERE repo_id='%s'",
-              repo_id);
-    if (sqlite_query_exec (mgr->db, sql) < 0)
+    if (sqlite_query_exec (mgr->db,
+                           "DELETE FROM CloneTasksMoreInfo WHERE repo_id=?",
+                           1, "string", repo_id) < 0)
         return -1;
 
     return 0;
@@ -714,6 +717,7 @@ add_transfer_task (CloneTask *task, GError **error)
                                             task->worktree,
                                             task->http_protocol_version,
                                             task->email,
+                                            task->username,
                                             task->use_fileserver_port,
                                             task->repo_name,
                                             error);
@@ -1020,6 +1024,11 @@ add_task_common (SeafCloneManager *mgr,
         json_t *repo_salt = json_object_get (object, "repo_salt");
         if (repo_salt)
             task->repo_salt = g_strdup (json_string_value (repo_salt));
+        json_t *username = json_object_get (object, "username");
+        if (username)
+            task->username = g_strdup (json_string_value (username));
+        integer = json_object_get (object, "resync_enc_repo");
+        task->resync_enc_repo = json_integer_value (integer);
         json_decref (object);
     }
 
@@ -1078,6 +1087,40 @@ check_encryption_args (const char *magic, int enc_version, const char *random_ke
 }
 
 static gboolean
+check_pwd_hash_encryption_args (const char *pwd_hash, int enc_version,
+                                const char *random_key,
+                                const char *repo_salt,
+                                GError **error)
+{
+    if (!pwd_hash) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Password hash must be specified");
+        return FALSE;
+    }
+
+    if (enc_version != 1 && enc_version != 2 && enc_version != 3 && enc_version != 4) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Unsupported enc version");
+        return FALSE;
+    }
+
+    if (enc_version >= 2) {
+        if (!random_key || strlen(random_key) != 96) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                         "Random key not specified");
+            return FALSE;
+        }
+        if (enc_version >= 3 && (!(repo_salt) || strlen(repo_salt) != 64) ) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                         "Repo salt not specified");
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static gboolean
 is_wt_repo_name_same (const char *worktree, const char *repo_name)
 {
     char *basename = g_path_get_basename (worktree);
@@ -1107,6 +1150,10 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
     char *ret = NULL;
     gboolean sync_wt_name = FALSE;
     char *repo_salt = NULL;
+    char *algo = NULL;
+    char *params = NULL;
+    char *pwd_hash = NULL;
+    gboolean resync_enc_repo = FALSE;
 
     if (!seaf->started) {
         seaf_message ("System not started, skip adding clone task.\n");
@@ -1134,10 +1181,24 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
         json_t *string = json_object_get (object, "repo_salt");
         if (string)
             repo_salt = g_strdup (json_string_value (string));
+        json_t *integer = json_object_get (object, "resync_enc_repo");
+        resync_enc_repo = json_integer_value (integer);
+        string = json_object_get (object, "pwd_hash_algo");
+        if (string)
+            algo = g_strdup (json_string_value (string));
+        string = json_object_get (object, "pwd_hash_params");
+        if (string)
+            params = g_strdup (json_string_value (string));
+        string = json_object_get (object, "pwd_hash");
+        if (string)
+            pwd_hash = g_strdup (json_string_value (string));
         json_decref (object);
     }
 
-    if (passwd &&
+    if (passwd && algo &&
+        !check_pwd_hash_encryption_args (pwd_hash, enc_version, random_key, repo_salt, error)) {
+        goto out;
+    } else if (passwd &&
         !check_encryption_args (magic, enc_version, random_key, repo_salt, error)) {
         goto out;
     }
@@ -1167,7 +1228,13 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
         goto out;
     }
 
-    if (passwd &&
+    if (passwd && algo) {
+        if (seafile_pwd_hash_verify_repo_passwd(enc_version, repo_id, passwd, repo_salt, pwd_hash, algo, params) < 0) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                         "Incorrect password");
+            goto out;
+        }
+    } else if (passwd &&
         seafile_verify_repo_passwd(repo_id, passwd, magic, enc_version, repo_salt) < 0) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
                      "Incorrect password");
@@ -1198,7 +1265,7 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
         seaf_repo_manager_remove_garbage_repo (seaf->repo_mgr, repo_id);
 
     /* Delete orphan information in the db in case the repo was corrupt. */
-    if (!repo)
+    if (!repo && !resync_enc_repo)
         seaf_repo_manager_remove_repo_ondisk (seaf->repo_mgr, repo_id, FALSE);
 
     ret = add_task_common (mgr, repo_id, repo_version,
@@ -1211,6 +1278,9 @@ seaf_clone_manager_add_task (SeafCloneManager *mgr,
 out:
     g_free (worktree);
     g_free (repo_salt);
+    g_free (algo);
+    g_free (params);
+    g_free (pwd_hash);
 
     return ret;
 }
@@ -1256,6 +1326,9 @@ seaf_clone_manager_add_download_task (SeafCloneManager *mgr,
     char *worktree = NULL;
     char *ret = NULL;
     char *repo_salt = NULL;
+    char *algo = NULL;
+    char *params = NULL;
+    char *pwd_hash = NULL;
 
     if (!seaf->started) {
         seaf_message ("System not started, skip adding clone task.\n");
@@ -1272,21 +1345,33 @@ seaf_clone_manager_add_download_task (SeafCloneManager *mgr,
 #endif
 
     if (more_info) {
-         json_error_t jerror;
-         json_t *object;
- 
-         object = json_loads (more_info, 0, &jerror);
-         if (!object) {
-             seaf_warning ("Failed to load more sync info from json: %s.\n", jerror.text);
-             goto out;
-         }
-         json_t *string = json_object_get (object, "repo_salt");
-         if (string)
-             repo_salt = g_strdup (json_string_value (string));
-         json_decref (object);
-     }
+        json_error_t jerror;
+        json_t *object;
 
-    if (passwd &&
+        object = json_loads (more_info, 0, &jerror);
+        if (!object) {
+            seaf_warning ("Failed to load more sync info from json: %s.\n", jerror.text);
+            goto out;
+        }
+        json_t *string = json_object_get (object, "repo_salt");
+        if (string)
+            repo_salt = g_strdup (json_string_value (string));
+        string = json_object_get (object, "pwd_hash_algo");
+        if (string)
+            algo = g_strdup (json_string_value (string));
+        string = json_object_get (object, "pwd_hash_params");
+        if (string)
+            params = g_strdup (json_string_value (string));
+        string = json_object_get (object, "pwd_hash");
+        if (string)
+            pwd_hash = g_strdup (json_string_value (string));
+        json_decref (object);
+    }
+
+    if (passwd && algo &&
+        !check_pwd_hash_encryption_args (pwd_hash, enc_version, random_key, repo_salt, error)) {
+        goto out;
+    } else if (passwd &&
         !check_encryption_args (magic, enc_version, random_key, repo_salt, error)) {
         goto out;
     }
@@ -1317,7 +1402,13 @@ seaf_clone_manager_add_download_task (SeafCloneManager *mgr,
         goto out;
     }
 
-    if (passwd &&
+    if (passwd && algo) {
+        if (seafile_pwd_hash_verify_repo_passwd(enc_version, repo_id, passwd, repo_salt, pwd_hash, algo, params) < 0) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
+                         "Incorrect password");
+            goto out;
+        }
+    } else if (passwd &&
         seafile_verify_repo_passwd(repo_id, passwd, magic, enc_version, repo_salt) < 0) {
         g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_GENERAL,
                      "Incorrect password");
@@ -1363,6 +1454,9 @@ out:
     g_free (worktree);
     g_free (wt_tmp);
     g_free (repo_salt);
+    g_free (algo);
+    g_free (params);
+    g_free (pwd_hash);
 
     return ret;
 }
@@ -1472,6 +1566,12 @@ on_repo_http_fetched (SeafileSession *seaf,
                                              repo->id,
                                              REPO_PROP_SERVER_URL,
                                              task->server_url);
+    }
+    if (task->username) {
+        seaf_repo_manager_set_repo_property (seaf->repo_mgr,
+                                             repo->id,
+                                             REPO_PROP_USERNAME,
+                                             task->username);
     }
 
     check_folder_permissions (task);

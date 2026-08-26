@@ -15,6 +15,7 @@
 #include "vc-utils.h"
 
 #include "sync-status-tree.h"
+#include "diff-simple.h"
 
 #ifdef WIN32
 #include <shlobj.h>
@@ -31,6 +32,7 @@
 #define MAX_RUNNING_SYNC_TASKS 5
 #define CHECK_LOCKED_FILES_INTERVAL 10 /* 10s */
 #define CHECK_FOLDER_PERMS_INTERVAL 30 /* 30s */
+#define JWT_TOKEN_EXPIRE_TIME 3*24*3600 /* 3 days */
 
 #define SYNC_PERM_ERROR_RETRY_TIME 2
 
@@ -43,6 +45,11 @@ struct _HttpServerState {
     char *effective_host;
     gboolean use_fileserver_port;
 
+    gboolean notif_server_checked;
+    gboolean notif_server_alive;
+
+    gboolean server_disconnected;
+
     gboolean folder_perms_not_supported;
     gint64 last_check_perms_time;
     gboolean checking_folder_perms;
@@ -50,6 +57,9 @@ struct _HttpServerState {
     gboolean locked_files_not_supported;
     gint64 last_check_locked_files_time;
     gboolean checking_locked_files;
+
+    gboolean immediate_check_folder_perms;
+    gboolean immediate_check_locked_files;
 
     /*
      * repo_id -> head commit id mapping.
@@ -59,8 +69,14 @@ struct _HttpServerState {
     pthread_mutex_t head_commit_map_lock;
     gboolean head_commit_map_init;
     gint64 last_update_head_commit_map_time;
+
+    gint64 n_jwt_token_request;
 };
 typedef struct _HttpServerState HttpServerState;
+
+typedef struct DelConfirmationResult {
+    gboolean resync;
+} DelConfirmationResult;
 
 struct _SeafSyncManagerPriv {
     struct SeafTimer *check_sync_timer;
@@ -77,6 +93,9 @@ struct _SeafSyncManagerPriv {
     GAsyncQueue *refresh_paths;
     struct SeafTimer *refresh_windows_timer;
 #endif
+
+    pthread_mutex_t del_confirmation_lock;
+    GHashTable *del_confirmation_tasks;
 };
 
 struct _ActivePathsInfo {
@@ -164,6 +183,11 @@ seaf_sync_manager_new (SeafileSession *seaf)
 #ifdef WIN32
     mgr->priv->refresh_paths = g_async_queue_new ();
 #endif
+
+    mgr->priv->del_confirmation_tasks = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                           g_free,
+                                                           g_free);
+    pthread_mutex_init (&mgr->priv->del_confirmation_lock, NULL);
 
     return mgr;
 }
@@ -515,7 +539,9 @@ is_perm_error (int error)
     return (error == SYNC_ERROR_ID_ACCESS_DENIED ||
             error == SYNC_ERROR_ID_NO_WRITE_PERMISSION ||
             error == SYNC_ERROR_ID_PERM_NOT_SYNCABLE ||
-            error == SYNC_ERROR_ID_FOLDER_PERM_DENIED);
+            error == SYNC_ERROR_ID_FOLDER_PERM_DENIED ||
+            error == SYNC_ERROR_ID_TOO_MANY_FILES ||
+            error == SYNC_ERROR_ID_QUOTA_FULL);
 }
 
 static void
@@ -568,7 +594,6 @@ transition_sync_state (SyncTask *task, int new_state)
          * Such file level errors are set with seaf_sync_manager_set_task_error_code().
          */
         if (new_state != SYNC_STATE_ERROR && task->error != SYNC_ERROR_ID_NO_ERROR) {
-            new_state = SYNC_STATE_ERROR;
             seaf_message ("Repo '%s' sync is finished but with error: %s\n",
                           task->repo->name,
                           sync_error_id_to_str(task->error));
@@ -629,7 +654,7 @@ set_task_error (SyncTask *task, int error)
          * File-level errors are recorded and notified in the location they happens, not here.
          */
         if (err_level == SYNC_ERROR_LEVEL_REPO)
-            seaf_repo_manager_record_sync_error (task->repo->id, task->repo->name, NULL, error);
+            send_file_sync_error_notification (task->repo->id, task->repo->name, NULL, error);
 
 #ifdef WIN32
         seaf_sync_manager_add_refresh_path (seaf->sync_mgr, task->repo->worktree);
@@ -695,9 +720,11 @@ start_fetch_if_necessary (SyncTask *task, const char *remote_head)
                                       repo->token,
                                       remote_head,
                                       FALSE,
-                                      NULL, NULL,
+                                      NULL,
+                                      NULL,
                                       task->http_version,
                                       repo->email,
+                                      repo->username,
                                       repo->use_fileserver_port,
                                       repo->name,
                                       &error) < 0) {
@@ -969,6 +996,11 @@ commit_job (void *vtask)
     return res;
 }
 
+static char *
+exceed_max_deleted_files (SeafRepo *repo);
+static void
+notify_delete_confirmation (const char *repo_name, const char *desc, const char *confirmation_id);
+
 static void
 commit_job_done (void *vres)
 {
@@ -997,8 +1029,20 @@ commit_job_done (void *vres)
         return;
     }
 
-    if (res->changed)
+    if (res->changed) {
+        char *desc = NULL;
+        desc = exceed_max_deleted_files (repo);
+        if (desc) {
+            notify_delete_confirmation (repo->name, desc, repo->head->commit_id);
+            seaf_warning ("Delete more than %d files, add delete confirmation.\n", seaf->delete_confirm_threshold);
+            task->info->del_confirmation_pending = TRUE;
+            set_task_error (res->task, SYNC_ERROR_ID_DEL_CONFIRMATION_PENDING);
+            g_free (desc);
+            g_free (res);
+            return;
+        }
         start_upload_if_necessary (res->task);
+    }
     else if (task->is_manual_sync || task->is_initial_commit)
         check_head_commit_http (task);
     else
@@ -1185,6 +1229,275 @@ out:
     return ret;
 }
 
+#define MAX_DELETED_FILES_NUM 100
+
+inline static char *
+get_basename (char *path)
+{
+    char *slash;
+    slash = strrchr (path, '/');
+    if (!slash)
+        return path;
+    return (slash + 1);
+}
+
+typedef struct _GetDeletedFilesAux {
+    char *basename;
+    int number;
+} GetDeletedFilesAux;
+
+static gboolean
+get_deleted_files_cb (SeafFSManager *mgr,
+                      const char *path,
+                      SeafDirent *dent,
+                      void *user_data,
+                      gboolean *stop)
+{
+    GetDeletedFilesAux *aux = user_data;
+
+    if (S_ISREG(dent->mode)) {
+        if (!aux->basename) {
+            char *basename = get_basename(dent->name);
+            aux->basename = g_strdup(basename);
+        }
+        aux->number++;
+    }
+    return TRUE;
+}
+
+static void
+get_number_of_deleted_files (SeafRepo *repo, const char *remote_root,
+                             DiffEntry *de, int *n_deleted, char **deleted_file)
+{
+    SeafDir *dir = NULL;
+    char dir_id[41];
+
+    rawdata_to_hex (de->sha1, dir_id, 20);
+    GetDeletedFilesAux *aux = g_new0 (GetDeletedFilesAux, 1);
+
+    if (seaf_fs_manager_traverse_path (seaf->fs_mgr,
+                                       repo->id, repo->version,
+                                       remote_root,
+                                       de->name,
+                                       get_deleted_files_cb,
+                                       aux) < 0) {
+        goto out;
+    }
+
+    if (*n_deleted == 0) {
+        *deleted_file = g_strdup (aux->basename);
+    }
+    *n_deleted += aux->number;
+
+out:
+    g_free (aux->basename);
+    g_free (aux);
+}
+
+static char *
+exceed_max_deleted_files (SeafRepo *repo)
+{
+    SeafBranch *master = NULL, *local = NULL;
+    SeafCommit *local_head = NULL, *master_head = NULL;
+    GList *diff_results = NULL;
+    char *deleted_file = NULL;
+    GString *desc = NULL;
+    char *ret = NULL;
+
+    local = seaf_branch_manager_get_branch (seaf->branch_mgr, repo->id, "local");
+    if (!local) {
+        seaf_warning ("No local branch found for repo %s(%.8s).\n",
+                      repo->name, repo->id);
+        goto out;
+    }
+
+    master = seaf_branch_manager_get_branch (seaf->branch_mgr, repo->id, "master");
+    if (!master) {
+        seaf_warning ("No master branch found for repo %s(%.8s).\n",
+                      repo->name, repo->id);
+        goto out;
+    }
+
+    local_head = seaf_commit_manager_get_commit (seaf->commit_mgr, repo->id, repo->version,
+                                                 local->commit_id);
+    if (!local_head) {
+        seaf_warning ("Failed to get head of local branch for repo %s.\n", repo->id);
+        goto out;
+    }
+
+    master_head = seaf_commit_manager_get_commit (seaf->commit_mgr, repo->id, repo->version,
+                                                  master->commit_id);
+    if (!master_head) {
+        seaf_warning ("Failed to get head of master branch for repo %s.\n", repo->id);
+        goto out;
+    }
+
+    diff_commit_roots (repo->id, repo->version, master_head->root_id, local_head->root_id, &diff_results, TRUE);
+    if (!diff_results) {
+        goto out;
+    }
+    GList *p;
+    DiffEntry *de;
+    int n_deleted = 0;
+
+    for (p = diff_results; p != NULL; p = p->next) {
+        de = p->data;
+        switch (de->status) {
+        case DIFF_STATUS_DELETED:
+            if (n_deleted == 0)
+                deleted_file = g_strdup(get_basename(de->name));
+            n_deleted++;
+            break;
+        case DIFF_STATUS_DIR_DELETED:
+            get_number_of_deleted_files (repo, master_head->root_id, de, &n_deleted, &deleted_file);
+            break;
+        }
+    }
+
+    if (n_deleted >= seaf->delete_confirm_threshold) {
+        desc = g_string_new ("");
+        g_string_append_printf (desc, "Deleted \"%s\" and %d more files.\n",
+                                deleted_file, n_deleted - 1);
+        ret = g_string_free (desc, FALSE);
+    }
+
+out:
+    g_free (deleted_file);
+    seaf_branch_unref (local);
+    seaf_branch_unref (master);
+    seaf_commit_unref (local_head);
+    seaf_commit_unref (master_head);
+    g_list_free_full (diff_results, (GDestroyNotify)diff_entry_free);
+
+    return ret;
+}
+
+static void
+notify_delete_confirmation (const char *repo_name, const char *desc, const char *confirmation_id)
+{
+    json_t *obj = json_object ();
+    json_object_set_string_member (obj, "repo_name", repo_name);
+    json_object_set_string_member (obj, "delete_files", desc);
+    json_object_set_string_member (obj, "confirmation_id", confirmation_id);
+
+    char *msg = json_dumps (obj, JSON_COMPACT);
+
+    seaf_mq_manager_publish_notification (seaf->mq_mgr, "sync.del_confirmation", msg);
+
+    json_decref (obj);
+    g_free (msg);
+}
+
+int
+seaf_sync_manager_add_del_confirmation (SeafSyncManager *mgr,
+                                        const char *confirmation_id,
+                                        gboolean resync)
+{
+    SeafSyncManagerPriv *priv = seaf->sync_mgr->priv;
+    DelConfirmationResult *result = NULL;
+
+    result = g_new0 (DelConfirmationResult, 1);
+    result->resync = resync;
+
+    pthread_mutex_lock (&priv->del_confirmation_lock);
+    g_hash_table_insert (priv->del_confirmation_tasks, g_strdup (confirmation_id), result);
+    pthread_mutex_unlock (&priv->del_confirmation_lock);
+
+    return 0;
+}
+
+static DelConfirmationResult *
+get_del_confirmation_result (const char *confirmation_id)
+{
+    SeafSyncManagerPriv *priv = seaf->sync_mgr->priv;
+    DelConfirmationResult *result, *copy = NULL;
+
+
+    pthread_mutex_lock (&priv->del_confirmation_lock);
+    result = g_hash_table_lookup (priv->del_confirmation_tasks, confirmation_id);
+    if (result) {
+        copy = g_new0 (DelConfirmationResult, 1);
+        copy->resync = result->resync;
+        g_hash_table_remove (priv->del_confirmation_tasks, confirmation_id);
+    }
+    pthread_mutex_unlock (&priv->del_confirmation_lock);
+
+    return copy;
+}
+
+static void
+resync_repo (SeafRepo *repo)
+{
+    GError *error = NULL;
+    char *repo_id = g_strdup (repo->id);
+    int repo_version = repo->version;
+    char *repo_name = g_strdup (repo->name);
+    char *token = g_strdup (repo->token);
+    char *magic = g_strdup (repo->magic);
+    int enc_version = repo->enc_version;
+    char *random_key = g_strdup (repo->random_key);
+    char *worktree = g_strdup (repo->worktree);
+    char *email = g_strdup (repo->email);
+    char *more_info = NULL;
+    gboolean is_encrypted = FALSE;
+    char key[65], iv[33];
+    json_t *obj = json_object ();
+
+    json_object_set_int_member (obj, "is_readonly", repo->is_readonly);
+    json_object_set_string_member (obj, "repo_salt", repo->salt);
+    json_object_set_string_member (obj, "server_url", repo->server_url);
+    if (repo->username)
+        json_object_set_string_member (obj, "username", repo->username);
+    if (repo->encrypted) {
+        is_encrypted = TRUE;
+        if (repo->enc_version == 1) {
+            rawdata_to_hex (repo->enc_key, key, 16);
+            rawdata_to_hex (repo->enc_iv, iv, 16);
+        } else if (repo->enc_version >= 2){
+            rawdata_to_hex (repo->enc_key, key, 32);
+            rawdata_to_hex (repo->enc_iv, iv, 16);
+        }
+        json_object_set_int_member (obj, "resync_enc_repo", TRUE);
+        if (repo->pwd_hash_algo) {
+            json_object_set_string_member (obj, "pwd_hash_algo", repo->pwd_hash_algo);
+            json_object_set_string_member (obj, "pwd_hash_params", repo->pwd_hash_params);
+            json_object_set_string_member (obj, "pwd_hash", repo->pwd_hash);
+        }
+    }
+
+    more_info = json_dumps (obj, 0);
+
+    if (repo->auto_sync && (repo->sync_interval == 0))
+        seaf_wt_monitor_unwatch_repo (seaf->wt_monitor, repo->id);
+
+    seaf_repo_manager_del_repo (seaf->repo_mgr, repo);
+
+    if (is_encrypted) {
+        seaf_repo_manager_save_repo_enc_info (seaf->repo_mgr, repo_id, key, iv);
+    }
+
+    char *ret = seaf_clone_manager_add_task (seaf->clone_mgr, repo_id,
+                                             repo_version, repo_name,
+                                             token, NULL,
+                                             magic, enc_version,
+                                             random_key, worktree,
+                                             email, more_info, &error);
+    if (error) {
+        seaf_warning ("Failed to clone repo %s: %s\n", repo_id, error->message);
+        g_clear_error (&error);
+    }
+    g_free (ret);
+    g_free (repo_id);
+    g_free (repo_name);
+    g_free (token);
+    g_free (magic);
+    g_free (random_key);
+    g_free (worktree);
+    g_free (email);
+    json_decref (obj);
+    g_free (more_info);
+}
+
 static int
 sync_repo_v2 (SeafSyncManager *manager, SeafRepo *repo, gboolean is_manual_sync)
 {
@@ -1192,6 +1505,7 @@ sync_repo_v2 (SeafSyncManager *manager, SeafRepo *repo, gboolean is_manual_sync)
     SyncTask *task;
     int ret = 0;
     char *last_download = NULL;
+    SyncInfo *info = NULL;
 
     master = seaf_branch_manager_get_branch (seaf->branch_mgr, repo->id, "master");
     if (!master) {
@@ -1220,9 +1534,42 @@ sync_repo_v2 (SeafSyncManager *manager, SeafRepo *repo, gboolean is_manual_sync)
         goto out;
     }
 
+    info = get_sync_info (manager, repo->id);
+
     if (strcmp (master->commit_id, local->commit_id) != 0) {
-        if (is_manual_sync || can_schedule_repo (manager, repo)) {
+        if (is_manual_sync || can_schedule_repo (manager, repo) || info->del_confirmation_pending) {
             task = create_sync_task_v2 (manager, repo, is_manual_sync, FALSE);
+            if (!task->info->del_confirmation_pending) {
+                char *desc = NULL;
+                desc = exceed_max_deleted_files (repo);
+                if (desc) {
+                    notify_delete_confirmation (repo->name, desc, local->commit_id);
+                    seaf_warning ("Delete more than %d files, add delete confirmation.\n", seaf->delete_confirm_threshold);
+                    task->info->del_confirmation_pending = TRUE;
+                    set_task_error (task, SYNC_ERROR_ID_DEL_CONFIRMATION_PENDING);
+                    g_free (desc);
+                    goto out;
+                }
+            } else {
+                DelConfirmationResult *result = get_del_confirmation_result (local->commit_id);
+                if (!result) {
+                    // User has not confirmed whether to continue syncing.
+                    set_task_error (task, SYNC_ERROR_ID_DEL_CONFIRMATION_PENDING);
+                    goto out;
+                } else if (result->resync) {
+                    // User chooses to resync.
+                    g_free (result);
+                    task->info->del_confirmation_pending = FALSE;
+                    set_task_error (task, SYNC_ERROR_ID_DEL_CONFIRMATION_PENDING);
+                    // Delete this repo and resync this repo by adding clone task.
+                    resync_repo (repo);
+                    ret = -1;
+                    goto out;
+                }
+                // User chooes to continue syncing.
+                g_free (result);
+                task->info->del_confirmation_pending = FALSE;
+            }
             start_upload_if_necessary (task);
         }
         /* Do nothing if the client still has something to upload
@@ -1256,6 +1603,56 @@ out:
     seaf_branch_unref (local);
     return ret;
 }
+
+void
+seaf_sync_manager_update_repo (SeafSyncManager *manager, SeafRepo *repo,
+                               const char *head_commit)
+{
+    HttpServerState *state;
+    SeafBranch *master = NULL;
+
+    state = g_hash_table_lookup (manager->http_server_states, repo->server_url);
+    if (!state) {
+        return;
+    }
+
+    master = seaf_branch_manager_get_branch (seaf->branch_mgr, repo->id, "master");
+    if (!master) {
+        return;
+    }
+
+    if (g_strcmp0(head_commit, master->commit_id) != 0) {
+        pthread_mutex_lock (&state->head_commit_map_lock);
+        g_hash_table_replace (state->head_commit_map, g_strdup (repo->id), g_strdup (head_commit));
+        pthread_mutex_unlock (&state->head_commit_map_lock);
+        // Set last_sync_time to 0 to allow the repo to be sync immediately.
+        // Otherwise it only gets synced after 30 seconds since the last sync.
+        repo->last_sync_time = 0;
+    }
+
+    seaf_branch_unref (master);
+    return;
+}
+
+void
+seaf_sync_manager_check_locks_and_folder_perms (SeafSyncManager *manager, const char *server_url)
+{
+    HttpServerState *state;
+
+    state = g_hash_table_lookup (manager->http_server_states, server_url);
+    if (!state) {
+        return;
+    }
+
+    if (!seaf_repo_manager_server_is_pro (seaf->repo_mgr, server_url))
+        return;
+
+    state->immediate_check_folder_perms = TRUE;
+    state->immediate_check_locked_files = TRUE;
+
+    return;
+}
+
 
 static void
 auto_delete_repo (SeafSyncManager *manager, SeafRepo *repo)
@@ -1409,6 +1806,90 @@ check_http_protocol (SeafSyncManager *mgr, SeafRepo *repo)
     return FALSE;
 }
 
+static void
+check_notif_server_done (gboolean is_alive, void *user_data)
+{
+    HttpServerState *state = user_data;
+    
+    if (is_alive) {
+        state->notif_server_alive = TRUE;
+        seaf_message ("Notification server is enabled on the remote server %s.\n", state->effective_host);
+    }
+}
+
+static char *
+http_notification_url (const char *url)
+{
+    const char *host;
+    char *colon;
+    char *url_no_port;
+    char *ret = NULL;
+
+    /* Just return the url itself if it's invalid. */
+    if (strlen(url) <= strlen("http://"))
+        return g_strdup(url);
+
+    /* Skip protocol schem. */
+    host = url + strlen("http://");
+
+    colon = strrchr (host, ':');
+    if (colon) {
+        url_no_port = g_strndup(url, colon - url);
+        ret = g_strconcat(url_no_port, ":8083", NULL);
+        g_free (url_no_port);
+    } else {
+        ret = g_strconcat(url, ":8083", NULL);
+    }
+
+    return ret;
+}
+
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+// Returns TRUE if notification server is alive; otherwise FALSE.
+// We only check notification server once.
+static gboolean
+check_notif_server (SeafSyncManager *mgr, SeafRepo *repo)
+{
+    if (!repo->server_url)
+        return FALSE;
+
+    HttpServerState *state = g_hash_table_lookup (mgr->http_server_states,
+                                                  repo->server_url);
+    if (!state) {
+        return FALSE;
+    }
+
+    if (state->notif_server_alive) {
+        return TRUE;
+    }
+
+    if (state->notif_server_checked) {
+        return FALSE;
+    }
+
+    char *notif_url = NULL;
+    if (state->use_fileserver_port) {
+        notif_url = http_notification_url (repo->server_url);
+    } else {
+        notif_url = g_strdup (repo->server_url);
+    }
+
+    if (http_tx_manager_check_notif_server (seaf->http_tx_mgr,
+                                            notif_url,
+                                            state->use_fileserver_port,
+                                            check_notif_server_done,
+                                            state) < 0) {
+        g_free (notif_url);
+        return FALSE;
+    }
+
+    state->notif_server_checked = TRUE;
+
+    g_free (notif_url);
+    return FALSE;
+}
+#endif
+
 gint
 cmp_repos_by_sync_time (gconstpointer a, gconstpointer b, gpointer user_data)
 {
@@ -1439,7 +1920,8 @@ cleanup_file_blocks (const char *repo_id, int version, const char *file_id)
 
 static gboolean
 handle_locked_file_update (SeafRepo *repo, struct index_state *istate,
-                           LockedFileSet *fset, const char *path, LockedFile *locked)
+                           LockedFileSet *fset, const char *path, LockedFile *locked,
+                           CheckoutBlockAux *aux)
 {
     gboolean locked_on_server = FALSE;
     struct cache_entry *ce;
@@ -1498,16 +1980,20 @@ handle_locked_file_update (SeafRepo *repo, struct index_state *istate,
 
     gboolean conflicted;
     gboolean force_conflict = (file_exists && st.st_mtime != locked->old_mtime);
-    if (seaf_fs_manager_checkout_file (seaf->fs_mgr,
-                                       repo->id, repo->version,
-                                       file_id, fullpath,
-                                       ce->ce_mode, ce->ce_mtime.sec,
-                                       crypt,
-                                       path,
-                                       master->commit_id,
-                                       force_conflict,
-                                       &conflicted,
-                                       repo->email) < 0) {
+    char *username = repo->username;
+    if (!username) {
+        username = repo->email;
+    }
+    if (seaf_repo_manager_checkout_file (repo,
+                                         file_id, fullpath,
+                                         ce->ce_mode, ce->ce_mtime.sec,
+                                         crypt,
+                                         path,
+                                         master->commit_id,
+                                         force_conflict,
+                                         &conflicted,
+                                         username,
+                                         aux) < 0) {
         seaf_warning ("Failed to checkout previously locked file %s in repo "
                       "%s(%.8s).\n",
                       path, repo->name, repo->id);
@@ -1608,6 +2094,12 @@ check_locked_files (void *vdata)
         return vdata;
     }
 
+    CheckoutBlockAux *aux = g_new0 (CheckoutBlockAux, 1);
+    aux->repo_id = g_strdup (repo->id);
+    aux->host = g_strdup (repo->effective_host);
+    aux->token = g_strdup (repo->token);
+    aux->use_fileserver_port = repo->use_fileserver_port;
+
     gboolean success;
     g_hash_table_iter_init (&iter, fset->locked_files);
     while (g_hash_table_iter_next (&iter, &key, &value)) {
@@ -1616,13 +2108,14 @@ check_locked_files (void *vdata)
 
         success = FALSE;
         if (strcmp (locked->operation, LOCKED_OP_UPDATE) == 0)
-            success = handle_locked_file_update (repo, &istate, fset, path, locked);
+            success = handle_locked_file_update (repo, &istate, fset, path, locked, aux);
         else if (strcmp (locked->operation, LOCKED_OP_DELETE) == 0)
             success = handle_locked_file_delete (repo, &istate, fset, path, locked);
 
         if (success)
             g_hash_table_iter_remove (&iter);
     }
+    free_checkout_block_aux (aux);
 
     discard_index (&istate);
     locked_file_set_free (fset);
@@ -1682,10 +2175,11 @@ check_folder_perms_done (HttpFolderPerms *result, void *user_data)
 }
 
 static void
-check_folder_permissions_one_server (SeafSyncManager *mgr,
-                                     const char *host,
-                                     HttpServerState *server_state,
-                                     GList *repos)
+check_folder_permissions_one_server_immediately (SeafSyncManager *mgr,
+                                                 const char *host,
+                                                 HttpServerState *server_state,
+                                                 GList *repos,
+                                                 gboolean force)
 {
     GList *ptr;
     SeafRepo *repo;
@@ -1694,22 +2188,13 @@ check_folder_permissions_one_server (SeafSyncManager *mgr,
     HttpFolderPermReq *req;
     GList *requests = NULL;
 
-    if (!seaf_repo_manager_server_is_pro (seaf->repo_mgr, host))
-        return;
-
-    gint64 now = (gint64)time(NULL);
-
-    if (server_state->http_version == 0 ||
-        server_state->folder_perms_not_supported ||
-        server_state->checking_folder_perms)
-        return;
-
-    if (server_state->last_check_perms_time > 0 &&
-        now - server_state->last_check_perms_time < CHECK_FOLDER_PERMS_INTERVAL)
-        return;
-
     for (ptr = repos; ptr; ptr = ptr->next) {
         repo = ptr->data;
+
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+        if (!force && seaf_notif_manager_is_repo_subscribed (seaf->notif_mgr, repo))
+            continue;
+#endif
 
         if (!repo->head)
             continue;
@@ -1752,6 +2237,35 @@ check_folder_permissions_one_server (SeafSyncManager *mgr,
         seaf_warning ("Failed to schedule check folder permissions\n");
         server_state->checking_folder_perms = FALSE;
     }
+}
+
+static void
+check_folder_permissions_one_server (SeafSyncManager *mgr,
+                                     const char *host,
+                                     HttpServerState *server_state,
+                                     GList *repos)
+{
+    if (!seaf_repo_manager_server_is_pro (seaf->repo_mgr, host))
+        return;
+
+    gint64 now = (gint64)time(NULL);
+
+    if (server_state->http_version == 0 ||
+        server_state->folder_perms_not_supported ||
+        server_state->checking_folder_perms)
+        return;
+
+    if (server_state->immediate_check_folder_perms) {
+        server_state->immediate_check_folder_perms = FALSE;
+        check_folder_permissions_one_server_immediately (mgr, host, server_state, repos, TRUE);
+        return;
+    }
+
+    if (server_state->last_check_perms_time > 0 &&
+        now - server_state->last_check_perms_time < CHECK_FOLDER_PERMS_INTERVAL)
+        return;
+
+    check_folder_permissions_one_server_immediately (mgr, host, server_state, repos, FALSE);
 }
 
 static void
@@ -1811,10 +2325,11 @@ check_server_locked_files_done (HttpLockedFiles *result, void *user_data)
 }
 
 static void
-check_locked_files_one_server (SeafSyncManager *mgr,
-                               const char *host,
-                               HttpServerState *server_state,
-                               GList *repos)
+check_locked_files_one_server_immediately (SeafSyncManager *mgr,
+                                           const char *host,
+                                           HttpServerState *server_state,
+                                           GList *repos,
+                                           gboolean force)
 {
     GList *ptr;
     SeafRepo *repo;
@@ -1823,22 +2338,13 @@ check_locked_files_one_server (SeafSyncManager *mgr,
     HttpLockedFilesReq *req;
     GList *requests = NULL;
 
-    if (!seaf_repo_manager_server_is_pro (seaf->repo_mgr, host))
-        return;
-
-    gint64 now = (gint64)time(NULL);
-
-    if (server_state->http_version == 0 ||
-        server_state->locked_files_not_supported ||
-        server_state->checking_locked_files)
-        return;
-
-    if (server_state->last_check_locked_files_time > 0 &&
-        now - server_state->last_check_locked_files_time < CHECK_FOLDER_PERMS_INTERVAL)
-        return;
-
     for (ptr = repos; ptr; ptr = ptr->next) {
         repo = ptr->data;
+
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+        if (!force && seaf_notif_manager_is_repo_subscribed (seaf->notif_mgr, repo))
+            continue;
+#endif
 
         if (!repo->head)
             continue;
@@ -1884,6 +2390,35 @@ check_locked_files_one_server (SeafSyncManager *mgr,
 }
 
 static void
+check_locked_files_one_server (SeafSyncManager *mgr,
+                               const char *host,
+                               HttpServerState *server_state,
+                               GList *repos)
+{
+    if (!seaf_repo_manager_server_is_pro (seaf->repo_mgr, host))
+        return;
+
+    gint64 now = (gint64)time(NULL);
+
+    if (server_state->http_version == 0 ||
+        server_state->locked_files_not_supported ||
+        server_state->checking_locked_files)
+        return;
+
+    if (server_state->immediate_check_locked_files) {
+        server_state->immediate_check_locked_files = FALSE;
+        check_locked_files_one_server_immediately (mgr, host, server_state, repos, TRUE);
+        return;
+    }
+
+    if (server_state->last_check_locked_files_time > 0 &&
+        now - server_state->last_check_locked_files_time < CHECK_FOLDER_PERMS_INTERVAL)
+        return;
+
+    check_locked_files_one_server_immediately (mgr, host, server_state, repos, FALSE);
+}
+
+static void
 check_server_locked_files (SeafSyncManager *mgr, GList *repos)
 {
     GHashTableIter iter;
@@ -1913,12 +2448,138 @@ print_active_paths (SeafSyncManager *mgr)
 }
 #endif
 
+static char *
+parse_jwt_token (const char *rsp_content, gint64 rsp_size)
+{
+    json_t *object = NULL;
+    json_error_t jerror;
+    const char *member = NULL;
+    char *jwt_token = NULL;
+
+    object = json_loadb (rsp_content, rsp_size, 0, &jerror);
+    if (!object) {
+        return NULL;
+    }
+
+    if (json_object_has_member (object, "jwt_token")) {
+        member = json_object_get_string_member (object, "jwt_token");
+        if (member)
+            jwt_token = g_strdup (member);
+    } else {
+        json_decref (object);
+        return NULL;
+    }
+
+    json_decref (object);
+    return jwt_token;
+}
+
+#define HTTP_FORBIDDEN 403
+#define HTTP_NOT_FOUND 404
+#define HTTP_SERVERR   500
+#define HTTP_SERVERR_BAD_GATEWAY    502
+#define HTTP_SERVERR_UNAVAILABLE    503
+#define HTTP_SERVERR_TIMEOUT        504
+
+typedef struct _GetJwtTokenAux {
+    HttpServerState *state;
+    char *repo_id;
+} GetJwtTokenAux;
+
+static void
+fileserver_get_jwt_token_cb (HttpAPIGetResult *result, void *user_data)
+{
+    GetJwtTokenAux *aux = user_data;
+    HttpServerState *state = aux->state;
+    char *repo_id = aux->repo_id;
+    SeafRepo *repo = NULL;
+    char *jwt_token = NULL;
+
+    state->n_jwt_token_request--;
+
+    if (result->http_status == HTTP_NOT_FOUND ||
+        result->http_status == HTTP_FORBIDDEN ||
+        result->http_status == HTTP_SERVERR) {
+        goto out;
+    }
+
+    if (!result->success) {
+        goto out;
+    }
+
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+    if (!repo)
+        goto out;
+
+    jwt_token = parse_jwt_token (result->rsp_content,result->rsp_size);
+    if (!jwt_token) {
+        seaf_warning ("Failed to parse jwt token for repo %s\n", repo->id);
+        goto out;
+    }
+    g_free (repo->jwt_token);
+    repo->jwt_token = jwt_token;
+
+out:
+    g_free (aux->repo_id);
+    g_free (aux);
+    return;
+}
+
 inline static gboolean
 periodic_sync_due (SeafRepo *repo)
 {
     int now = (int)time(NULL);
     return (now > (repo->last_sync_time + repo->sync_interval));
 }
+
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+static int
+check_and_subscribe_repo (SeafSyncManager *mgr, SeafRepo *repo)
+{
+    char *url = NULL;
+    HttpServerState *state = g_hash_table_lookup (mgr->http_server_states,
+                                                  repo->server_url);
+    if (!state || !state->notif_server_alive) {
+        return 0;
+    }
+
+    if (state->n_jwt_token_request > 10) {
+        return 0;
+    }
+
+    gint64 now = (gint64)time(NULL);
+    if (now - repo->last_check_jwt_token > JWT_TOKEN_EXPIRE_TIME) {
+        repo->last_check_jwt_token = now;
+        if (!repo->use_fileserver_port)
+            url = g_strdup_printf ("%s/seafhttp/repo/%s/jwt-token", repo->effective_host, repo->id);
+        else
+            url = g_strdup_printf ("%s/repo/%s/jwt-token", repo->effective_host, repo->id);
+
+        state->n_jwt_token_request++;
+        GetJwtTokenAux *aux = g_new0 (GetJwtTokenAux, 1);
+        aux->repo_id = g_strdup (repo->id);
+        aux->state = state;
+        if (http_tx_manager_fileserver_api_get (seaf->http_tx_mgr,
+                                            repo->effective_host,
+                                            url,
+                                            repo->token,
+                                            fileserver_get_jwt_token_cb,
+                                            aux) < 0) {
+            g_free (aux->repo_id);
+            g_free (aux);
+            state->n_jwt_token_request--;
+        }
+        g_free (url);
+        return 0;
+    }
+    if (!seaf_notif_manager_is_repo_subscribed (seaf->notif_mgr, repo)) {
+        if (repo->jwt_token && repo->server_url)
+            seaf_notif_manager_subscribe_repo (seaf->notif_mgr, repo);
+    }
+
+    return 0;
+}
+#endif
 
 static int
 auto_sync_pulse (void *vmanager)
@@ -1993,26 +2654,31 @@ auto_sync_pulse (void *vmanager)
         if (!repo->head)
             continue;
 
+        gint64 now = (gint64)time(NULL);
+
 #if defined WIN32 || defined __APPLE__
         if (repo->version > 0) {
             if (repo->checking_locked_files)
                 continue;
 
-            gint64 now = (gint64)time(NULL);
-            if (repo->last_check_locked_time == 0 ||
-                now - repo->last_check_locked_time >= CHECK_LOCKED_FILES_INTERVAL)
-            {
-                repo->checking_locked_files = TRUE;
-                if (seaf_job_manager_schedule_job (seaf->job_mgr,
-                                                   check_locked_files,
-                                                   check_locked_files_done,
-                                                   repo) < 0) {
-                    seaf_warning ("Failed to schedule check local locked files\n");
-                    repo->checking_locked_files = FALSE;
-                } else {
-                    repo->last_check_locked_time = now;
-                }
+            // Since delayed file updates requires blocks from the server, we need to check the protocol information before updating.
+            if (check_http_protocol (manager, repo)) {
+                if (repo->last_check_locked_time == 0 ||
+                    now - repo->last_check_locked_time >= CHECK_LOCKED_FILES_INTERVAL)
+                {
+                    repo->checking_locked_files = TRUE;
+                    if (seaf_job_manager_schedule_job (seaf->job_mgr,
+                                                       check_locked_files,
+                                                       check_locked_files_done,
+                                                       repo) < 0) {
+                        seaf_warning ("Failed to schedule check local locked files\n");
+                        repo->checking_locked_files = FALSE;
+                    } else {
+                        repo->last_check_locked_time = now;
+                    }
 
+                }
+            
             }
         }
 #endif
@@ -2025,13 +2691,34 @@ auto_sync_pulse (void *vmanager)
         if (info->sync_perm_err_cnt > SYNC_PERM_ERROR_RETRY_TIME)
             continue;
 
+        if (repo->encrypted && repo->enc_key[0] == '\0'){
+            repo->empty_enc_key = TRUE;
+            continue;
+        }
+
         if (repo->version > 0) {
             /* For repo version > 0, only use http sync. */
             if (check_http_protocol (manager, repo)) {
-                if (repo->sync_interval == 0)
-                    sync_repo_v2 (manager, repo, FALSE);
-                else if (periodic_sync_due (repo))
-                    sync_repo_v2 (manager, repo, TRUE);
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+                if (check_notif_server (manager, repo)) {
+                    seaf_notif_manager_connect_server (seaf->notif_mgr, repo->server_url, repo->use_fileserver_port);
+                }
+#endif
+
+                if (repo->sync_interval == 0) {
+                    if (sync_repo_v2 (manager, repo, FALSE) < 0) 
+                        continue;
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+                    check_and_subscribe_repo (manager, repo);
+#endif
+                }
+                else if (periodic_sync_due (repo)) {
+                    if (sync_repo_v2 (manager, repo, TRUE) < 0)
+                        continue;
+#if defined WIN32 || defined __APPLE__ || defined COMPILE_LINUX_WS
+                    check_and_subscribe_repo (manager, repo);
+#endif
+                }
             }
         } else {
             seaf_warning ("Repo %s(%s) is version 0 library. Syncing is no longer supported.\n",
@@ -2262,11 +2949,10 @@ seaf_sync_manager_update_active_path (SeafSyncManager *mgr,
             sync_status_tree_add (info->syncing_tree, path, mode, refresh);
         else if (status == SYNC_STATUS_SYNCED)
             sync_status_tree_add (info->synced_tree, path, mode, refresh);
-        else {
 #ifdef WIN32
+        else if (refresh)
             seaf_sync_manager_add_refresh_path (mgr, path);
 #endif
-        }
     } else if (existing != status) {
         g_hash_table_replace (info->paths, g_strdup(path), (void*)status);
 
@@ -2279,9 +2965,9 @@ seaf_sync_manager_update_active_path (SeafSyncManager *mgr,
             sync_status_tree_add (info->syncing_tree, path, mode, refresh);
         else if (status == SYNC_STATUS_SYNCED)
             sync_status_tree_add (info->synced_tree, path, mode, refresh);
-
 #ifdef WIN32
-        seaf_sync_manager_add_refresh_path (mgr, path);
+        else if (refresh)
+            seaf_sync_manager_add_refresh_path (mgr, path);
 #endif
     }
 
@@ -2589,6 +3275,7 @@ update_head_commit_ids_for_server (gpointer key, gpointer value, gpointer user_d
 {
     char *server_url = key;
     HttpServerState *state = value;
+    int status = 200;
 
     /* Only get head commit ids from server if:
      * 1. syncing protocol version has been checked, and
@@ -2605,8 +3292,15 @@ update_head_commit_ids_for_server (gpointer key, gpointer value, gpointer user_d
         GHashTable *new_map = http_tx_manager_get_head_commit_ids (seaf->http_tx_mgr,
                                                                    state->effective_host,
                                                                    state->use_fileserver_port,
-                                                                   repo_id_list);
+                                                                   repo_id_list, &status);
         if (new_map) {
+            //If the fileserver hangs up before sending events to the notification server,
+            // the client will not receive the updates, and some updates will be lost.
+            // Therefore, after the fileserver recovers, immediately checking locks and folder perms.
+            if (state->server_disconnected) {
+                seaf_sync_manager_check_locks_and_folder_perms (seaf->sync_mgr, server_url);
+            }
+            state->server_disconnected = FALSE;
             pthread_mutex_lock (&state->head_commit_map_lock);
             g_hash_table_destroy (state->head_commit_map);
             state->head_commit_map = new_map;
@@ -2614,6 +3308,12 @@ update_head_commit_ids_for_server (gpointer key, gpointer value, gpointer user_d
                 state->head_commit_map_init = TRUE;
             state->last_update_head_commit_map_time = (gint64)time(NULL);
             pthread_mutex_unlock (&state->head_commit_map_lock);
+        } else {
+            if (status == HTTP_SERVERR_BAD_GATEWAY ||
+                status == HTTP_SERVERR_UNAVAILABLE ||
+                status == HTTP_SERVERR_TIMEOUT) {
+                state->server_disconnected = TRUE;
+            }
         }
 
         g_list_free_full (repo_id_list, g_free);
